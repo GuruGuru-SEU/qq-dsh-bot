@@ -95,11 +95,19 @@ The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after chan
 
 Only explicit OneBot `at` segments addressed to the bot trigger work. Private messages, untrusted groups, @all, text resembling an @mention, and the bot's own messages do not trigger tasks. Live messages more than five minutes old are archived without triggering. Trigger deduplication persists for seven days.
 
-Each request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
+Each ordinary request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
 
 Replies default to 1–3 short sentences, usually under 300 Chinese characters, in the requester's language. Markdown is converted to plain text, preserving URLs and code contents. Replies have a hard 1800-character cap.
 
 Foreground requests run one at a time, with up to five queued requests. A separate worker can execute one approved background DSH occurrence concurrently. Further mentions are ignored while the queue is full. Image preparation is limited to 60 seconds, followed by a five-minute DSH deadline. Timeouts and failures receive a short error reply. Restarting loses in-memory queued work; ambiguous send failures are not retried automatically to avoid duplicates.
+
+## Status command
+
+In a trusted group, @mention the bot with `/status` anywhere in the message text (case-sensitive), for example `@bot 请检查 /status 现在怎么样`. The bridge replies directly with a plain-text status snapshot, without starting DSH, calling an LLM, preparing images for a model, or executing other instructions in that message. The usual real @mention, group trust, freshness and deduplication checks still apply. Quoted messages and attachment metadata do not trigger the command.
+
+Status reports the bridge uptime, verified NapCat connection, global foreground queue and worker health, container memory, free space on the state filesystem, and the current group's background jobs, active schedules and last finished foreground diagnostics. It never reports other groups' identities, task contents, raw logs or credentials. Metrics unavailable on the host are marked unavailable.
+
+A dedicated status worker replies even when the foreground worker is busy or its queue is full. Its own queue accepts up to 20 pending status requests; excess status requests are dropped without falling back to DSH. Replies use the normal quoted-message delivery and archive path. Connection or delivery failures are logged and never retried blindly. Restarting clears pending status requests.
 
 ## Persistent history and images
 

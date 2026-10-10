@@ -20,6 +20,7 @@ from media import ImageCache
 from messaging import AGENT_GUIDANCE, MessageService
 from background import GUIDANCE as BACKGROUND_GUIDANCE, BackgroundService
 from plaintext import plain_reply
+from status_report import status_report
 from upload import OneBotError, UploadService
 
 LOG = logging.getLogger("qq-dsh")
@@ -205,12 +206,16 @@ class Bridge:
         self.state_path = Path(state_path)
         self.archives = {}
         self.queue = asyncio.Queue(maxsize=5)
+        self.status_queue = asyncio.Queue(maxsize=20)
+        self.started_at = time.monotonic()
+        self.status_task = None
         self.ws = None
         self.pending = {}
         self.connected = asyncio.Event()
         self.identity_ok = False
         self.last_event = None
         self.active = None
+        self.active_since = None
         self.worker_task = None
         self.history_task = None
         self.media_task = None
@@ -437,7 +442,6 @@ class Bridge:
             return
         message_id = str(data["message_id"])
         archive = self.archive(group)
-        context = archive.recent(before=float(data.get("time", time.time())))
         archive.save(data)
         if sender == self.config["bot_qq"]:
             return
@@ -453,10 +457,20 @@ class Bridge:
         if abs(time.time() - float(data.get("time", time.time()))) > 300:
             return
         body = text_of(segments)
-        context = [message for message in context if message["message_id"] != message_id]
         mentioned = any(s.get("type") == "at" and str(s["data"].get("qq")) == str(self.config["bot_qq"]) for s in segments)
         if not mentioned:
             return
+        # Inspect all actual text, before prompt truncation; never match image metadata
+        # or quoted history. Keep API waits out of the WebSocket receive loop.
+        command_text = "".join(str(s["data"].get("text", "")) for s in segments if s.get("type") == "text")
+        if "/status" in command_text:
+            if self.status_queue.full():
+                LOG.warning("status_queue_full group=%s message=%s", group, message_id)
+            else:
+                self.status_queue.put_nowait(Job(group, message_id, sender, "", []))
+            return
+        context = archive.recent(before=float(data.get("time", time.time())), limit=31)
+        context = [message for message in context if message["message_id"] != message_id][-30:]
         job = Job(group, message_id, sender, body, context)
         if self.queue.full():
             LOG.warning("queue_full group=%s message=%s", group, message_id)
@@ -495,10 +509,29 @@ class Bridge:
                 await asyncio.sleep(1)
         LOG.info("replied group=%s message=%s chars=%s", job.group, job.message_id, len(text))
 
+    async def status_worker(self):
+        """Read-only commands bypass DSH and the sequential model queue."""
+        while True:
+            job = await self.status_queue.get()
+            try:
+                if not self.trusted(job.group):
+                    continue
+                try:
+                    answer = status_report(self, job.group)
+                except Exception as exc:
+                    LOG.error("status_failed kind=%s", type(exc).__name__)
+                    answer = "状态读取失败，请查看服务端日志；本次未调用模型。"
+                await self.reply(job, answer)
+            except Exception as exc:
+                LOG.error("status_reply_failed group=%s message=%s kind=%s", job.group, job.message_id, type(exc).__name__)
+            finally:
+                self.status_queue.task_done()
+
     async def worker(self):
         while True:
             job = await self.queue.get()
             self.active = job.message_id
+            self.active_since = time.monotonic()
             try:
                 if not self.trusted(job.group):
                     continue
@@ -531,6 +564,7 @@ class Bridge:
                 LOG.error("reply_failed group=%s message=%s kind=%s", job.group, job.message_id, type(exc).__name__)
             finally:
                 self.active = None
+                self.active_since = None
                 self.queue.task_done()
 
     async def health(self, request):
@@ -539,10 +573,14 @@ class Bridge:
 
     async def lifecycle(self, app):
         self.worker_task = asyncio.create_task(self.worker())
+        self.status_task = asyncio.create_task(self.status_worker())
         self.media_task = asyncio.create_task(self.cache_images())
         self.scheduler_task = asyncio.create_task(self.messages.run())
         self.background_task = asyncio.create_task(self.background.run())
         yield
+        self.status_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.status_task
         self.background_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.background_task

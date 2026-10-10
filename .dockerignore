@@ -1,6 +1,7 @@
 *
 !Dockerfile
 !bot.py
+!status_report.py
 !test_bot.py
 !history.py
 !plaintext.py
