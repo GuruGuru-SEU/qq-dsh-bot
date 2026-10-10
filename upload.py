@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 
 from aiohttp import web
-from history import current_archive
+from history import current_workspace
 
 MAX_BYTES = 20 * 1024 * 1024
 MAX_FILES = 3
@@ -31,6 +31,9 @@ class Grant:
     group: int
     message_id: str
     workspace: Path
+    sender: int = 0
+    context: list = field(default_factory=list)
+    background: bool = False
     started: float = field(default_factory=time.monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -83,9 +86,10 @@ class UploadService:
 
     def begin(self, job):
         token = secrets.token_urlsafe(32)
-        workspace = self.state / "groups" / str(job.group) / "workspace"
+        root = getattr(job, "run_root", None) or self.state / "groups" / str(job.group)
+        workspace = root / "workspace"
         workspace.mkdir(parents=True, exist_ok=True)
-        self.grants[token] = Grant(job.group, str(job.message_id), workspace)
+        self.grants[token] = Grant(job.group, str(job.message_id), workspace, sender=job.sender, context=job.context, background=getattr(job, "background", False))
         # DSH deliberately strips credential-shaped environment variables from
         # shell tools. Publish only this scoped grant outside its writable workspace.
         path = workspace.parent / ".upload-request.json"
@@ -178,7 +182,7 @@ def capability():
     if os.environ.get("QQ_UPLOAD_TOKEN"):
         return {"token": os.environ["QQ_UPLOAD_TOKEN"], "url": os.environ.get("QQ_UPLOAD_URL", "http://127.0.0.1:8080/agent/upload")}
     try:
-        return json.loads((current_archive().parent / ".upload-request.json").read_text())
+        return json.loads((current_workspace().parent / ".upload-request.json").read_text())
     except (OSError, ValueError):
         return {}
 

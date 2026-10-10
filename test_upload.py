@@ -159,7 +159,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_helper_finds_group_capability_when_shell_scrubs_environment(self):
         path = self.workspace.parent / ".upload-request.json"
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        with patch.dict(os.environ, {}, clear=True), patch("upload.current_archive", return_value=self.workspace.parent / "history.sqlite3"):
+        with patch.dict(os.environ, {}, clear=True), patch("upload.current_workspace", return_value=self.workspace):
             self.assertEqual(capability()["token"], self.token)
             self.bridge.uploads.end(self.token)
             self.assertFalse(path.exists())

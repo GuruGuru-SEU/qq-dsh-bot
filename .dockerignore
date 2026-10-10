@@ -13,3 +13,5 @@
 !test_upload.py
 !messaging.py
 !test_messaging.py
+!background.py
+!test_background.py

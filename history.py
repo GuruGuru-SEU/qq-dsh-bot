@@ -203,13 +203,28 @@ def query(path, *, date=None, start=None, end=None, user=None, contains=None, me
         db.close()
 
 
-def current_archive():
-    # No group/path argument: bind the helper to the working directory selected by the bridge.
+def current_workspace():
+    # Background runs have private workspaces but query the same group archive.
     cwd = Path.cwd().resolve()
     for directory in [cwd, *cwd.parents]:
-        if directory.name == "workspace" and directory.parent.parent == Path("/state/groups") and directory.parent.name.isdigit():
-            return directory.parent / "history.sqlite3"
-    raise ValueError("Run history queries inside the current group's workspace")
+        if directory.name != "workspace":
+            continue
+        try:
+            parts = directory.relative_to("/state/groups").parts
+        except ValueError:
+            continue
+        if parts[0].isdigit() and (len(parts) == 2 or (
+                len(parts) == 6 and parts[1] == "background" and parts[3] == "runs"
+                and len(parts[2]) == 16 and all(c in "0123456789abcdef" for c in parts[2])
+                and parts[4].isdigit())):
+            return directory
+    raise ValueError("Run helpers inside the current group's workspace")
+
+
+def current_archive():
+    workspace = current_workspace()
+    group = workspace.relative_to("/state/groups").parts[0]
+    return Path("/state/groups") / group / "history.sqlite3"
 
 
 def main():
