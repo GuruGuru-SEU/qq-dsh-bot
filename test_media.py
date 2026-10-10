@@ -95,6 +95,42 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bridge.db.close()
 
+    async def test_separate_image_survives_waiting_text_only_request(self):
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"trusted_groups": [123456789], "bot_qq": 12345, "history_sync": False}))
+        bridge = Bridge(config, self.root, "t" * 40)
+        try:
+            first = message("1")
+            first["user_id"] = 9
+            first["message"][0] = {"type": "text", "data": {"text": "reply something"}}
+            await bridge.event(first)
+            image = message("2")
+            image["message"] = image["message"][:1]
+            await bridge.event(image)
+            request = message("3")
+            request["message"][0] = {"type": "text", "data": {"text": "what is in this image?"}}
+            await bridge.event(request)
+            bridge.queue.get_nowait()
+            job = bridge.queue.get_nowait()
+            for mid in range(100, 205):
+                later = message(str(mid))
+                later["message"] = [{"type": "text", "data": {"text": "later conversation"}}]
+                await bridge.event(later)
+            await bridge.prepare_transcriptions(job)
+            with patch("media.download_image", AsyncMock(return_value=picture())):
+                await bridge.prepare_images(job)
+            bridge.refresh_images(job)
+            self.assertEqual(job.images, [])
+            self.assertEqual([row["message_id"] for row in job.context], ["1", "2"])
+            attachment = job.context[1]["images"][0]
+            self.assertEqual(attachment["status"], "ready")
+            prompt = prompt_for(job)
+            self.assertIn(attachment["file_path"], prompt)
+            self.assertIn('"recent_images": [{"message_id": "2", "sender_id": 8', prompt)
+            self.assertIn("A text-only @mention can refer to an image", prompt)
+        finally:
+            bridge.db.close()
+
     async def test_download_validation_size_limit_and_url_boundaries(self):
         for url in ["http://127.0.0.1/private", "file:///etc/passwd", "https://qq.com.evil.test/a", "https://user:pass@gchat.qpic.cn/a", "https://qq.com:8080/a"]:
             with self.assertRaises(ValueError):

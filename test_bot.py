@@ -89,6 +89,70 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.prepare_transcriptions(jobs[2])
         self.assertEqual([message["message_id"] for message in jobs[2].context], ["1", "2"])
 
+    async def test_busy_group_replies_to_each_mention_in_order(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        replies = []
+
+        async def runner(job):
+            self.jobs.append(job.message_id)
+            if job.message_id == "1":
+                started.set()
+                await release.wait()
+            return job.message_id
+
+        async def reply(job, text):
+            replies.append((job.message_id, text))
+
+        self.bridge.runner = runner
+        self.bridge.reply = reply
+        app_runner = web.AppRunner(self.bridge.app())
+        await app_runner.setup()
+        try:
+            await self.bridge.event(self.event(1))
+            await asyncio.wait_for(started.wait(), 2)
+            await self.bridge.event(self.event(2))
+            await self.bridge.event(self.event(3))
+            self.assertEqual(self.jobs, ["1"])
+            release.set()
+            await asyncio.wait_for(self.bridge.queue.join(), 2)
+            self.assertEqual(replies, [("1", "1"), ("2", "2"), ("3", "3")])
+        finally:
+            await app_runner.cleanup()
+
+    async def test_new_group_worker_runs_while_other_group_is_busy(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        replies = []
+
+        async def runner(job):
+            if job.group == 123456789:
+                started.set()
+                await release.wait()
+            return str(job.group)
+
+        async def reply(job, text):
+            replies.append((job.group, job.message_id))
+
+        self.bridge.runner = runner
+        self.bridge.reply = reply
+        app_runner = web.AppRunner(self.bridge.app())
+        await app_runner.setup()
+        try:
+            await self.bridge.event(self.event(1))
+            await asyncio.wait_for(started.wait(), 2)
+            self.config.write_text(json.dumps({"trusted_groups": [123456789, 777], "bot_qq": 12345, "history_sync": False}))
+            await self.bridge.event(self.event(2, group=777))
+            await asyncio.wait_for(self.bridge.queue_for(777).join(), 2)
+            self.assertEqual(replies, [(777, "2")])
+            self.assertEqual(self.bridge.active_by_group, {123456789: "1"})
+            self.assertIn(777, self.bridge.worker_tasks)
+            release.set()
+            await asyncio.wait_for(self.bridge.queue.join(), 2)
+            self.assertEqual(replies, [(777, "2"), (123456789, "1")])
+        finally:
+            await app_runner.cleanup()
+
     async def test_voice_is_transcribed_and_added_to_trigger_and_history(self):
         calls = []
         async def api(action, params, **kwargs):
@@ -291,6 +355,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 await worker
 
     async def test_status_real_websocket_bypasses_busy_full_model_queue(self):
+        self.bridge.queue = asyncio.Queue(maxsize=5)
+        self.bridge.queues[123456789] = self.bridge.queue
         started = asyncio.Event()
         async def busy(job):
             self.jobs.append(job)
@@ -370,11 +436,12 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         stale = self.event(4)
         stale['time'] -= 1000
         await self.bridge.event(stale)
-        for mid in range(10, 16):
+        capacity = self.bridge.queue.maxsize
+        for mid in range(10, 11 + capacity):
             await self.bridge.event(self.event(mid))
         await self.bridge.event(self.event(10))
         await asyncio.gather(*self.bridge.receipt_tasks)
-        self.assertEqual([c[1]['message_id'] for c in calls], [str(i) for i in range(10, 15)])
+        self.assertEqual([c[1]['message_id'] for c in calls], [str(i) for i in range(10, 10 + capacity)])
         self.assertTrue(all(c[0] == 'set_msg_emoji_like' and c[1]['set'] for c in calls))
 
     async def test_reaction_failures_do_not_prevent_reply(self):
