@@ -26,6 +26,15 @@ from upload import OneBotError, UploadService
 
 LOG = logging.getLogger("qq-dsh")
 
+# QQ may acknowledge fetch_ptt_text before the translated text is available.
+# Keep retries bounded so a voice message cannot hold the foreground worker
+# indefinitely, while giving the server a few seconds to publish the result.
+PTT_ATTEMPTS = 3
+PTT_API_TIMEOUT = 10
+PTT_ATTEMPT_TIMEOUT = 12
+PTT_RETRY_DELAYS = (0.0, 1.0, 3.0)
+PTT_PREPARE_TIMEOUT = 45
+
 
 def load_config(path):
     data = json.loads(Path(path).read_text())
@@ -554,7 +563,10 @@ class Bridge:
         task = self.transcription_tasks.get(key)
         if task is not None and not task.done():
             return task
-        if self.archive(group).transcription(message_id) is not None:
+        saved = self.archive(group).transcription(message_id)
+        # An unavailable result is retryable. In particular, the first
+        # fetch_ptt_text call can race QQ's asynchronous transcription.
+        if saved is not None and saved.get("status") == "ready":
             return None
         task = asyncio.create_task(self.transcribe_message(group, str(message_id)))
         self.transcription_tasks[key] = task
@@ -563,18 +575,31 @@ class Bridge:
 
     async def transcribe_message(self, group, message_id):
         async with self.transcription_sem:
-            try:
-                result = await asyncio.wait_for(
-                    self.api("fetch_ptt_text", {"message_id": message_id}, timeout=12), 15)
-                text = result.get("text") if isinstance(result, dict) else None
-                if not isinstance(text, str) or not text.strip():
-                    raise ValueError("empty_transcription")
-                self.archive(group).set_transcription(message_id, text=text, status="ready")
-                LOG.info("ptt_transcribed group=%s message=%s chars=%s", group, message_id, len(text))
-            except Exception as exc:
-                with contextlib.suppress(Exception):
-                    self.archive(group).set_transcription(message_id, status="unavailable", error_kind=type(exc).__name__)
-                LOG.info("ptt_unavailable group=%s message=%s kind=%s", group, message_id, type(exc).__name__)
+            last_exc = None
+            for attempt in range(PTT_ATTEMPTS):
+                if PTT_RETRY_DELAYS[attempt]:
+                    await asyncio.sleep(PTT_RETRY_DELAYS[attempt])
+                try:
+                    result = await asyncio.wait_for(
+                        self.api("fetch_ptt_text", {"message_id": message_id}, timeout=PTT_API_TIMEOUT),
+                        PTT_ATTEMPT_TIMEOUT)
+                    text = result.get("text") if isinstance(result, dict) else None
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValueError("empty_transcription")
+                    self.archive(group).set_transcription(message_id, text=text, status="ready")
+                    LOG.info("ptt_transcribed group=%s message=%s attempt=%s chars=%s",
+                             group, message_id, attempt + 1, len(text))
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt + 1 < PTT_ATTEMPTS:
+                        LOG.info("ptt_retry group=%s message=%s attempt=%s kind=%s",
+                                 group, message_id, attempt + 1, type(exc).__name__)
+            with contextlib.suppress(Exception):
+                self.archive(group).set_transcription(
+                    message_id, status="unavailable", error_kind=type(last_exc).__name__)
+            LOG.info("ptt_unavailable group=%s message=%s attempts=%s kind=%s",
+                     group, message_id, PTT_ATTEMPTS, type(last_exc).__name__)
 
     async def prepare_transcriptions(self, job):
         archive = self.archive(job.group)
@@ -585,7 +610,7 @@ class Bridge:
         tasks = [task for mid in dict.fromkeys(ids)
                  if (task := self.schedule_transcription(job.group, mid)) is not None]
         if tasks:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 20)
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), PTT_PREPARE_TIMEOUT)
         job.context = [message for message in archive.recent(before=time.time(), limit=31)
                        if message["message_id"] != str(job.message_id)][-30:]
         job.text = archive.message_text(job.message_id) or job.text

@@ -99,6 +99,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         result = query(self.bridge.archive(123456789).path, message_id='77')
         self.assertIn('请用 C++ 实现并测试', result['messages'][0]['text'])
 
+    async def test_voice_transcription_retries_transient_empty_result(self):
+        calls = []
+        async def api(action, params, **kwargs):
+            calls.append(action)
+            if len(calls) == 1:
+                return {}
+            return {'text': '稍后才返回的语音文字'}
+
+        self.bridge.api = api
+        event = self.event(79)
+        event['message'][0] = {'type': 'record', 'data': {'file': 'voice.amr'}}
+        with patch('bot.PTT_RETRY_DELAYS', (0.0, 0.0, 0.0)):
+            await self.bridge.event(event)
+            await asyncio.gather(*self.bridge.transcription_tasks.values())
+
+        self.assertEqual(calls, ['fetch_ptt_text', 'fetch_ptt_text'])
+        self.assertEqual(self.bridge.archive(123456789).transcription('79')['status'], 'ready')
+        self.assertIn('稍后才返回的语音文字', self.bridge.archive(123456789).message_text('79'))
+
     async def test_voice_failure_is_bounded_and_keeps_audio_placeholder(self):
         async def api(action, params, **kwargs):
             raise RuntimeError('transcription unavailable')
