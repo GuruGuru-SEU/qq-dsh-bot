@@ -10,7 +10,7 @@ import re
 import time
 import uuid
 
-from history import ZONE, current_workspace
+from history import ZONE, current_workspace, current_archive
 
 LOG = logging.getLogger("qq-dsh")
 REASONS = {"completed", "max-tokens", "error", "aborted", "blocked", "interrupted", "forked"}
@@ -90,13 +90,25 @@ class RunDiagnostics:
             LOG.error('diagnostic_save_failed kind=%s', type(exc).__name__)
 
 
+def current_diagnostics_root():
+    root = current_workspace().parent
+    try:
+        data = json.loads((root / '.upload-request.json').read_text())
+        target = Path(data['diagnostics_root']).resolve()
+        if target.is_relative_to(current_archive().parent.resolve()):
+            return target
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return root.parent.parent if root.parent.name == 'foreground' else root
+
+
 def main():
     parser = argparse.ArgumentParser(description='Read content-free diagnostics for a completed run in this workspace')
     parser.add_argument('--message-id', help='Trigger message ID; defaults to the last completed run')
     args = parser.parse_args()
     try:
         name = record_name(args.message_id) if args.message_id else 'last.json'
-        print((current_workspace().parent / 'diagnostics' / name).read_text())
+        print((current_diagnostics_root() / 'diagnostics' / name).read_text())
     except (ValueError, OSError):
         parser.exit(1, 'No saved diagnostics for that run in this workspace.\n')
 

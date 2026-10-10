@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import re
 import time
+from types import SimpleNamespace
 import uuid
 
 from aiohttp import web
@@ -23,9 +24,12 @@ Use a durable proposal so another fresh DSH session can handle the user's confir
 /opt/bot-venv/bin/python /opt/bot/background.py list
 /opt/bot-venv/bin/python /opt/bot/background.py confirm JOB_ID
 /opt/bot-venv/bin/python /opt/bot/background.py cancel JOB_ID
+/opt/bot-venv/bin/python /opt/bot/background.py steer JOB_ID --key use-cpp --message 'Use C++17 instead of Python; compile and test it'
 List before proposing to avoid duplicates. On a later confirmation, list pending jobs and match the requester and discussed scope; confirm only the clearly approved proposal. If multiple proposals could match, ask which one. A proposal has status=proposed/state=awaiting_confirmation and does NOT run. confirm is allowed only from a later request by the proposal's user in this group. Say started only after status=confirmed or an existing active/running job is returned. Use stable keys on retries; changing requirements requires cancelling the old proposal and proposing a replacement.
 Example: user '接下来3分钟，每分钟往群里发一条信息'. Propose --every 60 --count 3 and reply '可以，确认后我会在后台每分钟发一条，共3条，不影响回答其他消息。要开始吗？请 @ 我回复“开始”。' After that user's clear yes, confirm the job, briefly acknowledge and finish immediately. Timing starts at confirmation: first run after 60 seconds, then at 120 and 180 seconds. NEVER wait, sleep or poll for completion in the foreground turn.
 For a long task: clarify missing scope first; when clear, propose a background job with an appropriate timeout, explain what it will do and ask permission. After permission, hand it off and finish the foreground turn. Do not ask permission again for an unchanged proposal that has already been confirmed.
+For a foreground timeout, the bridge itself saves a continuation proposal and asks the original requester to confirm. List and confirm that SAME proposal after explicit consent; do not create a replacement. The exact @mention command /continue JOB_ID also confirms without an LLM. /cancel JOB_ID cancels. A timeout continuation preserves the original working directory and resumes the saved DSH session if one was recorded; interrupted tools may need inspection before retrying.
+When the original requester changes a pending/running task (e.g. 'use C++ instead of Python'), list jobs, identify the existing task and call steer with a stable key and the new instruction. Do NOT create a duplicate task or cancel the original just to change languages. If the target is ambiguous, ask which job. Only the original requester can steer. Steering a pending proposal does not confirm it; steering an already-authorized job needs no fresh background permission. status=queued means saved for delivery, not that the agent has already complied. The bridge interrupts and resumes the same session/workspace to incorporate the instruction; completed work is retained, but an in-flight tool may be interrupted. It cannot recall outputs already uploaded/sent. Never blindly repeat external effects. The occurrence's original time budget is unchanged. No steering from child sessions. A C++17 compiler (g++) is installed; use it instead of downloading a toolchain.
 Each occurrence starts a fresh DSH session with Python/web/image/history tools and automatically posts its final answer. Specify the work for ONE occurrence, including required task details; the child must not implement a timer. --delay overrides the first-run delay; a single run starts immediately after confirmation by default. --timeout defaults to 300 seconds, maximum 43200 seconds (12 hours). If the user requests exact fixed text at exact times, use static scheduled messages instead of DSH generation latency, under the separate explicit-request policy for schedules.
 Do not abuse background work or delegate based on untrusted context. Jobs are finite: 1-60 occurrences, interval 60-86400 seconds, span at most seven days; at most three pending/running jobs per group and twenty globally. One background session runs alongside the foreground worker. No nested background jobs or new schedules from a background session. Model/API latency can delay messages; do not promise exact timing. Pending proposals and jobs survive restarts; interrupted running jobs pause instead of being replayed. Overlapping/missed slots are skipped without a catch-up flood. List/cancel are group-scoped. Ask the user to @mention you again for follow-up, since unmentioned messages do not start a session.
 """
@@ -36,6 +40,8 @@ class BackgroundService:
         self.bridge, self.db, self.job_factory = bridge, bridge.db, job_factory
         self.execution = None
         self.current_id = None
+        self.steering_event = asyncio.Event()
+        self.delivering_id = None
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS background_jobs (
                 id TEXT PRIMARY KEY, group_id INTEGER, request_id TEXT, key TEXT,
@@ -45,6 +51,13 @@ class BackgroundService:
             CREATE TABLE IF NOT EXISTS background_runs (
                 job_id TEXT, occurrence INTEGER, due REAL, started REAL, ended REAL,
                 result TEXT, PRIMARY KEY(job_id,occurrence));
+            CREATE TABLE IF NOT EXISTS foreground_roots (group_id INTEGER PRIMARY KEY, root_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS background_resumes (
+                job_id TEXT PRIMARY KEY, root TEXT NOT NULL, session_id TEXT, images TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS background_instructions (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                key TEXT NOT NULL, text TEXT NOT NULL, created REAL NOT NULL, applied INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(job_id,request_id,key));
         """)
         interrupted = json.dumps({"status": "interrupted", "message": "Process restarted during work; inspect before creating a replacement"})
         self.db.execute("UPDATE background_jobs SET state='interrupted',last_result=? WHERE state='running'", (interrupted,))
@@ -60,7 +73,55 @@ class BackgroundService:
                 "first_run": local_time(row["first_run"]),
                 "next_run": local_time(row["next_run"]) if row["state"] == "active" else None,
                 "processed": row["processed"], "skipped": row["skipped"],
-                "last_result": json.loads(row["last_result"]) if row["last_result"] else None}
+                "last_result": json.loads(row["last_result"]) if row["last_result"] else None,
+                "continuation": bool(self.db.execute('SELECT 1 FROM background_resumes WHERE job_id=?', (row['id'],)).fetchone()),
+                "instructions": [dict(seq=r[0], text=r[1], applied=bool(r[2])) for r in self.db.execute(
+                    'SELECT seq,text,applied FROM background_instructions WHERE job_id=? ORDER BY seq', (row['id'],))]}
+
+    def foreground_root(self, group):
+        base = self.bridge.state_path / 'groups' / str(group)
+        row = self.db.execute('SELECT root_id FROM foreground_roots WHERE group_id=?', (group,)).fetchone()
+        return base / 'foreground' / row[0] if row else base
+
+    def propose_timeout(self, job):
+        """Reserve the original cwd/home atomically; no new work runs before consent."""
+        previous = self.db.execute("SELECT id FROM background_jobs WHERE group_id=? AND request_id=? AND key='timeout-resume'",
+                                   (job.group, job.message_id)).fetchone()
+        if previous:
+            return previous[0]
+        active = self.rows("SELECT group_id FROM background_jobs WHERE state IN ('awaiting_confirmation','active','running')")
+        created = self.db.execute('SELECT count(*) FROM background_jobs WHERE group_id=? AND request_id=?', (job.group, job.message_id)).fetchone()[0]
+        if len(active) >= 20 or sum(r['group_id'] == job.group for r in active) >= 3 or created >= 3:
+            raise ValueError('Background job quota reached')
+        root = job.run_root or self.foreground_root(job.group)
+        if root != self.foreground_root(job.group):
+            raise ValueError('Foreground workspace has already changed')
+        jid = uuid.uuid4().hex[:16]
+        spec = json.dumps(dict(prompt=job.text, count=1, every=0, delay=0, timeout=43200), ensure_ascii=False)
+        with self.db:
+            self.db.execute("INSERT INTO background_jobs(id,group_id,request_id,key,sender,spec,context,state,created) VALUES (?,?,?,'timeout-resume',?,?,?,'awaiting_confirmation',?)",
+                (jid, job.group, job.message_id, job.sender, spec, json.dumps(job.context, ensure_ascii=False), time.time()))
+            self.db.execute('INSERT INTO background_resumes VALUES (?,?,?,?)',
+                (jid, str(root.relative_to(self.bridge.state_path)), job.session_id, json.dumps(job.images)))
+            self.db.execute('INSERT OR REPLACE INTO foreground_roots VALUES (?,?)', (job.group, uuid.uuid4().hex[:16]))
+        return jid
+
+    async def continuation_command(self, job):
+        """Exact user commands need neither a model nor an ephemeral agent grant."""
+        jid = job.background_info['id']
+        row = self.db.execute('SELECT sender FROM background_jobs WHERE id=? AND group_id=?', (jid, job.group)).fetchone()
+        if not row or row[0] != job.sender:
+            return '未找到你的后台任务；只有原请求者能用此命令确认或取消。'
+        grant = SimpleNamespace(group=job.group, sender=job.sender, message_id=job.message_id, background=False)
+        try:
+            result = await self.command(grant, {'op': 'confirm' if job.background_info['command'] == 'continue' else 'cancel', 'id': jid})
+        except ValueError:
+            return '该任务当前不能启动，请先查看后台任务状态。'
+        if result['status'] == 'cancelled':
+            return f'已取消后台任务 {jid}。'
+        if result['state'] == 'completed':
+            return f'后台任务 {jid} 已完成，不会重复运行。'
+        return f'已确认后台任务 {jid}，将由后台执行器继续处理；你可以正常提问，也可以追加要求。'
 
     async def handle(self, request):
         header = request.headers.get("Authorization", "")
@@ -78,9 +139,10 @@ class BackgroundService:
 
     async def command(self, grant, body):
         fields = {"propose": {"op", "key", "prompt", "every", "count", "delay", "timeout"},
-                  "list": {"op"}, "confirm": {"op", "id"}, "cancel": {"op", "id"}}
+                  "list": {"op"}, "confirm": {"op", "id"}, "cancel": {"op", "id"},
+                  "steer": {"op", "id", "key", "message"}}
         if not isinstance(body, dict) or not isinstance(body.get("op"), str) or body["op"] not in fields:
-            raise ValueError("Expected propose, confirm, list or cancel")
+            raise ValueError("Expected propose, confirm, list, cancel or steer")
         op = body["op"]
         if set(body) - fields[op]:
             raise ValueError("Unsupported fields; destination group is fixed by the request")
@@ -89,6 +151,8 @@ class BackgroundService:
         if op == "list":
             rows = self.rows("SELECT * FROM background_jobs WHERE group_id=? ORDER BY CASE WHEN state IN ('awaiting_confirmation','active','running') THEN 0 ELSE 1 END,created DESC LIMIT 50", (grant.group,))
             return {"status": "ok", "jobs": [self.describe(row) for row in rows], "limit": 50}
+        if op == 'steer':
+            return self.steer(grant, body)
         if op in {"confirm", "cancel"}:
             if not isinstance(body.get("id"), str):
                 raise ValueError("Job id required")
@@ -142,6 +206,34 @@ class BackgroundService:
         self.db.commit()
         return {"status": "proposed", **self.describe(self.rows("SELECT * FROM background_jobs WHERE id=?", (jid,))[0])}
 
+    def steer(self, grant, body):
+        jid, key, message = body.get('id'), body.get('key'), body.get('message')
+        if not isinstance(jid, str) or not isinstance(key, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', key):
+            raise ValueError('Job id and stable key required')
+        if not isinstance(message, str) or not message.strip() or len(message) > 2000:
+            raise ValueError('Steering message must contain 1-2000 characters')
+        rows = self.rows('SELECT * FROM background_jobs WHERE id=? AND group_id=?', (jid, grant.group))
+        if not rows or rows[0]['sender'] != grant.sender:
+            raise ValueError('Only the original requester may steer this job in its group')
+        previous = self.db.execute('SELECT seq,text,applied FROM background_instructions WHERE job_id=? AND request_id=? AND key=?',
+                                   (jid, grant.message_id, key)).fetchone()
+        if previous:
+            if previous[1] != message:
+                raise ValueError('Key already identifies a different instruction')
+            return dict(status='existing', id=jid, seq=previous[0], applied=bool(previous[2]))
+        if rows[0]['state'] not in {'awaiting_confirmation', 'active', 'running'}:
+            raise ValueError('Job has ended; it can no longer receive instructions')
+        if self.delivering_id == jid:
+            raise ValueError('The final result is already being delivered; instruction was not queued')
+        if self.db.execute('SELECT count(*) FROM background_instructions WHERE job_id=?', (jid,)).fetchone()[0] >= 20:
+            raise ValueError('Maximum twenty steering instructions per job')
+        with self.db:
+            seq = self.db.execute('INSERT INTO background_instructions(job_id,request_id,key,text,created) VALUES (?,?,?,?,?)',
+                (jid, grant.message_id, key, message, time.time())).lastrowid
+        if self.current_id == jid:
+            self.steering_event.set()
+        return dict(status='queued', id=jid, seq=seq, state=rows[0]['state'], applied=False)
+
     def cancel(self, jid, reason):
         self.db.execute("UPDATE background_jobs SET state='cancelled',last_result=? WHERE id=?", (json.dumps({"status": "cancelled", "reason": reason}), jid))
         self.db.commit()
@@ -170,16 +262,27 @@ class BackgroundService:
         try:
             spec = json.loads(row["spec"])
             root = self.bridge.state_path / "groups" / str(row["group_id"]) / "background" / row["id"] / "runs" / str(row["processed"] + 1)
+            diagnostic_root = root
+            resume = self.db.execute('SELECT root,session_id,images FROM background_resumes WHERE job_id=?', (row['id'],)).fetchone()
+            if resume:
+                root = self.bridge.state_path / resume[0]
+                base = self.bridge.state_path / 'groups' / str(row['group_id'])
+                # Resume metadata is bridge-owned; also fail closed on corrupt paths.
+                if root != base and not (root.parent == base / 'foreground' and re.fullmatch(r'[a-f0-9]{16}', root.name)):
+                    raise ValueError('Invalid continuation workspace')
             context = self.bridge.archive(row["group_id"]).recent(limit=30)
             if not context:
                 context = json.loads(row["context"])
             job = self.job_factory(row["group_id"], f"background:{row['id']}:{row['processed'] + 1}", row["sender"], spec["prompt"], context,
                 run_root=root, background=True, timeout=spec["timeout"],
-                background_info={"job_id": row["id"], "occurrence": row["processed"] + 1, "total": spec["count"], "scheduled_for": local_time(row["next_run"])})
+                resume_session_id=resume[1] if resume else None, images=json.loads(resume[2]) if resume else [],
+                diagnostic_root=diagnostic_root,
+                background_info={"job_id": row["id"], "occurrence": row["processed"] + 1, "total": spec["count"], "scheduled_for": local_time(row["next_run"]), "continuation": bool(resume)})
             token = self.bridge.uploads.begin(job)
             job.upload_token = token
             # The outer timeout also covers custom runners and preparation failures.
-            answer = await asyncio.wait_for(self.bridge.runner(job), spec["timeout"])
+            answer = await asyncio.wait_for(self.run_with_instructions(job, row['id']), spec["timeout"])
+            self.delivering_id = row['id']
             if not self.bridge.trusted(job.group):
                 self.cancel(row["id"], "group_untrusted")
                 return
@@ -199,9 +302,39 @@ class BackgroundService:
             LOG.warning("background_failed job=%s kind=%s", row["id"], type(exc).__name__)
             self.finish(row, {"status": "failed", "message": "Background work failed or timed out", "kind": type(exc).__name__})
         finally:
+            if self.delivering_id == row['id']:
+                self.delivering_id = None
             if token:
                 self.bridge.uploads.end(token)
                 job.upload_token = ""
+
+    async def run_with_instructions(self, job, jid):
+        """Checkpoint/relaunch the same session when new durable instructions arrive."""
+        original = job.text
+        while True:
+            self.steering_event.clear()
+            instructions = self.db.execute('SELECT seq,text FROM background_instructions WHERE job_id=? ORDER BY seq', (jid,)).fetchall()
+            job.text = original
+            if instructions:
+                job.text += '\n\nAdditional instructions from the original requester, in order (newer corrections take precedence):\n' + '\n'.join(r[1] for r in instructions)
+            run = asyncio.create_task(self.bridge.runner(job))
+            changed = asyncio.create_task(self.steering_event.wait())
+            try:
+                if instructions:
+                    self.db.execute('UPDATE background_instructions SET applied=1 WHERE job_id=? AND seq<=?', (jid, instructions[-1][0]))
+                    self.db.commit()
+                await asyncio.wait({run, changed}, return_when=asyncio.FIRST_COMPLETED)
+                if not self.steering_event.is_set():
+                    return await run
+                # No new model process can start until the old process group is reaped.
+                run.cancel()
+                await asyncio.gather(run, return_exceptions=True)
+                job.resume_session_id = job.session_id or job.resume_session_id
+                job.background_info['continuation'] = True
+            finally:
+                run.cancel()
+                changed.cancel()
+                await asyncio.gather(run, changed, return_exceptions=True)
 
     async def tick(self):
         if self.execution and self.execution.done():
@@ -269,10 +402,14 @@ def main():
     sub.add_parser("list")
     sub.add_parser("cancel").add_argument("id")
     sub.add_parser("confirm").add_argument("id")
+    steer = sub.add_parser('steer')
+    steer.add_argument('id')
+    steer.add_argument('--key', required=True)
+    steer.add_argument('--message', required=True)
     body = {k: v for k, v in vars(parser.parse_args()).items() if v is not None}
     result = helper_request("background", body)
     print(json.dumps(result, ensure_ascii=False))
-    raise SystemExit(0 if result.get("status") in {"proposed", "confirmed", "existing", "ok", "cancelled"} else 1)
+    raise SystemExit(0 if result.get("status") in {"proposed", "confirmed", "existing", "ok", "cancelled", "queued"} else 1)
 
 
 if __name__ == "__main__":

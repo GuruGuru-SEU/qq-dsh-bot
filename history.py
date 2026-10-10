@@ -214,6 +214,8 @@ def current_workspace():
         except ValueError:
             continue
         if parts[0].isdigit() and (len(parts) == 2 or (
+                len(parts) == 4 and parts[1] == "foreground"
+                and re.fullmatch(r"[a-f0-9]{16}", parts[2])) or (
                 len(parts) == 6 and parts[1] == "background" and parts[3] == "runs"
                 and len(parts[2]) == 16 and all(c in "0123456789abcdef" for c in parts[2])
                 and parts[4].isdigit())):

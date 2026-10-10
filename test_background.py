@@ -311,11 +311,117 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         await self.service.execution
         self.assertEqual(len(self.runs), 2)
 
+    async def test_timeout_proposal_preserves_session_and_rotates_foreground_after_restart(self):
+        root = self.service.foreground_root(self.job.group)
+        self.job.run_root, self.job.session_id = root, 'session-progress'
+        (root / 'workspace' / 'progress.cpp').write_text('saved progress')
+        self.job.images = [{'file_path': '/saved/image.png', 'status': 'ready'}]
+        jid = self.service.propose_timeout(self.job)
+        self.assertEqual(self.service.propose_timeout(self.job), jid)
+        self.assertEqual(self.row(jid)['state'], 'awaiting_confirmation')
+        await self.service.tick()
+        self.assertFalse(self.runs)
+        replacement = self.service.foreground_root(self.job.group)
+        self.assertNotEqual(root, replacement)
+        restarted = BackgroundService(self.bridge, Job)
+        self.assertEqual(restarted.foreground_root(self.job.group), replacement)
+        other = self.bridge.uploads.begin(Job(self.job.group, 'wrong-user', 9, 'yes', []))
+        with self.assertRaises(ValueError):
+            await self.service.command(self.bridge.uploads.grants[other], {'op': 'confirm', 'id': jid})
+        confirm = Job(self.job.group, 'later-yes', 8, '', [], background_info={'command': 'continue', 'id': jid})
+        self.assertIn('已确认', await self.service.continuation_command(confirm))
+        await self.fire(jid)
+        resumed = self.runs[0]
+        self.assertEqual(resumed.run_root, root)
+        self.assertEqual(resumed.resume_session_id, 'session-progress')
+        self.assertEqual(resumed.timeout, 43200)
+        self.assertEqual(resumed.images, self.job.images)
+        self.assertTrue(resumed.background)
+        self.assertNotEqual(resumed.diagnostic_root, root)
+        self.assertEqual((root / 'workspace' / 'progress.cpp').read_text(), 'saved progress')
+
+    async def test_steer_running_job_resumes_same_session_without_extra_final(self):
+        result, _ = await self.create()
+        started, cancelled = asyncio.Event(), asyncio.Event()
+        sessions = []
+        async def runner(job):
+            sessions.append((job.run_root, job.resume_session_id, job.text))
+            if len(sessions) == 1:
+                job.session_id = 'session-original'
+                (job.run_root / 'workspace' / 'progress.txt').write_text('preserved')
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            self.assertTrue(cancelled.is_set())
+            self.assertEqual((job.run_root / 'workspace' / 'progress.txt').read_text(), 'preserved')
+            return 'C++ result'
+        self.bridge.runner = runner
+        await self.service.tick()
+        await asyncio.wait_for(started.wait(), 2)
+        body = {'op': 'steer', 'id': result['id'], 'key': 'cpp', 'message': 'Use C++ instead of Python'}
+        queued = await self.service.command(self.grant, body)
+        self.assertEqual(queued['status'], 'queued')
+        again = await self.service.command(self.grant, body)
+        self.assertEqual(again['seq'], queued['seq'])
+        await asyncio.wait_for(self.service.execution, 2)
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sessions[0][0], sessions[1][0])
+        self.assertEqual(sessions[1][1], 'session-original')
+        self.assertIn('Use C++ instead of Python', sessions[1][2])
+        self.assertEqual(self.row(result['id'])['processed'], 1)
+        self.assertEqual(self.row(result['id'])['state'], 'completed')
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_steering_scope_validation_pending_consent_and_persistence(self):
+        _, result = await self.post({'op': 'propose', 'key': 'pending', 'prompt': 'implement in Python'})
+        body = {'op': 'steer', 'id': result['id'], 'key': 'cpp', 'message': 'Use C++17'}
+        self.assertEqual((await self.post(body))[1]['status'], 'queued')
+        self.assertEqual(self.row(result['id'])['state'], 'awaiting_confirmation')
+        await self.service.tick()
+        self.assertFalse(self.runs)
+        restarted = BackgroundService(self.bridge, Job)
+        description = restarted.describe(self.row(result['id']))
+        self.assertEqual(description['instructions'][0]['text'], 'Use C++17')
+        for message, key in [('', 'empty'), ('x' * 2001, 'long'), ('different', 'cpp')]:
+            self.assertEqual((await self.post({**body, 'key': key, 'message': message}))[0], 400)
+        for group, sender, background in [(123456789, 9, False), (987654321, 8, False), (123456789, 8, True)]:
+            token = self.bridge.uploads.begin(Job(group, 'bad', sender, '', [], background=background,
+                run_root=self.root / 'other' / f'{group}-{sender}-{background}'))
+            self.assertEqual((await self.post(body, token))[0], 400)
+        confirm = Job(self.job.group, 'yes', 8, '', [], background_info={'command': 'continue', 'id': result['id']})
+        await self.service.continuation_command(confirm)
+        await self.fire(result['id'])
+        self.assertIn('Use C++17', self.runs[0].text)
+        self.assertEqual((await self.post({**body, 'key': 'too-late'}))[0], 400)
+
+    async def test_steering_does_not_reset_outer_deadline(self):
+        result, _ = await self.create()
+        started = asyncio.Event()
+        stopped = []
+        async def runner(job):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.append(True)
+        self.bridge.runner = runner
+        job = Job(self.job.group, 'deadline', 8, 'work', [], background=True)
+        task = asyncio.create_task(asyncio.wait_for(self.service.run_with_instructions(job, result['id']), .15))
+        self.service.current_id = result['id']
+        await started.wait()
+        await self.service.command(self.grant, {'op': 'steer', 'id': result['id'], 'key': 'change', 'message': 'Use C++'})
+        with self.assertRaises(asyncio.TimeoutError):
+            await task
+        self.assertEqual(len(stopped), 2)
+
 
 class WorkspaceTests(unittest.TestCase):
     def test_foreground_background_history_and_capability_paths(self):
         for path, workspace in [
             ('/state/groups/123456789/workspace/sub', '/state/groups/123456789/workspace'),
+            ('/state/groups/123456789/foreground/0123456789abcdef/workspace/sub', '/state/groups/123456789/foreground/0123456789abcdef/workspace'),
             ('/state/groups/123456789/background/0123456789abcdef/runs/2/workspace/sub', '/state/groups/123456789/background/0123456789abcdef/runs/2/workspace')]:
             with patch('history.Path.cwd', return_value=Path(path)):
                 self.assertEqual(current_workspace(), Path(workspace))

@@ -136,6 +136,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await self.bridge.event(self.event(1))
             await asyncio.wait_for(self.bridge.queue.join(), 2)
             self.assertIn("5 分钟", replies[0])
+            self.assertIn('/continue ', replies[0])
+            self.assertIn('转到后台继续', replies[0])
+            self.assertEqual(self.bridge.db.execute('SELECT state FROM background_jobs').fetchone()[0], 'awaiting_confirmation')
+            self.assertFalse(self.bridge.background.execution)
             self.assertIsNone(self.bridge.active)
         finally:
             worker.cancel()
@@ -172,6 +176,31 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         normal['message'].append({'type': 'image', 'data': {'file': '/status'}})
         await self.bridge.event(normal)
         self.assertEqual(self.bridge.queue.qsize(), 1)
+
+    async def test_exact_continuation_confirmation_bypasses_model_and_checks_owner(self):
+        from bot import Job
+        original = Job(123456789, 'original', 8, 'long task', [])
+        jid = self.bridge.background.propose_timeout(original)
+        worker = asyncio.create_task(self.bridge.status_worker())
+        replies = []
+        async def reply(job, text): replies.append(text)
+        self.bridge.reply = reply
+        try:
+            for mid, sender in [(50, 9), (51, 8)]:
+                event = self.event(mid, sender=sender)
+                event['message'][0]['data']['text'] = '/continue ' + jid
+                await self.bridge.event(event)
+                await asyncio.wait_for(self.bridge.status_queue.join(), 2)
+                state = self.bridge.db.execute('SELECT state FROM background_jobs WHERE id=?', (jid,)).fetchone()[0]
+                self.assertEqual(state, 'awaiting_confirmation' if sender == 9 else 'active')
+            self.assertIn('只有原请求者', replies[0])
+            self.assertIn('已确认', replies[1])
+            self.assertTrue(self.bridge.queue.empty())
+            self.assertEqual(self.jobs, [])
+        finally:
+            worker.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
 
     async def test_status_real_websocket_bypasses_busy_full_model_queue(self):
         started = asyncio.Event()

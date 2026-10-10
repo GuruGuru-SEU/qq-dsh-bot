@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from bot import Bridge, Job, run_dsh
-from diagnostics import DSHFailure, record_name
+from diagnostics import DSHFailure, record_name, current_diagnostics_root
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -121,6 +121,34 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await run_dsh(self.job),'done')
         self.assertIn(43200,timeouts)
         self.assertEqual(self.record()['timeout_seconds'],43200)
+
+    async def test_resume_passes_exact_session_and_retains_workspace(self):
+        self.job.resume_session_id = 'session-checkpoint'
+        workspace = self.job.run_root / 'workspace'
+        workspace.mkdir(parents=True)
+        (workspace / 'progress.txt').write_text('already computed')
+        self.executable("assert sys.argv[sys.argv.index('--session-id')+1] == 'session-checkpoint'\n"
+                        "assert open('progress.txt').read() == 'already computed'\n"
+                        "assert os.environ['DSH_HOME'] == os.path.dirname(os.getcwd()) + '/home'\n"
+                        "print(json.dumps({'type':'session','sessionId':'session-checkpoint'}))\n"
+                        "print(json.dumps({'type':'status','phase':'turn_end','reason':{'kind':'completed'}}))\n"
+                        "print(json.dumps({'type':'final','text':'continued'}))\n")
+        self.assertEqual(await run_dsh(self.job), 'continued')
+        self.assertEqual(self.job.session_id, 'session-checkpoint')
+        self.job.resume_session_id = '../../bad'
+        with self.assertRaises(ValueError):
+            await run_dsh(self.job)
+
+    async def test_continuation_diagnostics_follow_scoped_capability(self):
+        group = self.root / 'groups' / '123456789'
+        group.mkdir(parents=True)
+        target = group / 'background' / '0123456789abcdef' / 'runs' / '1'
+        cap = group / '.upload-request.json'
+        with patch('diagnostics.current_workspace', return_value=group / 'workspace'), patch('diagnostics.current_archive', return_value=group / 'history.sqlite3'):
+            cap.write_text(json.dumps({'diagnostics_root': str(target)}))
+            self.assertEqual(current_diagnostics_root(), target)
+            cap.write_text(json.dumps({'diagnostics_root': str(self.root / 'other-group')}))
+            self.assertEqual(current_diagnostics_root(), group)
 
     async def test_worker_posts_specific_token_limit_reply(self):
         config=self.root/'config.json'

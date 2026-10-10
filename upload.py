@@ -95,7 +95,8 @@ class UploadService:
         path = workspace.parent / ".upload-request.json"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as target:
-            json.dump({"token": token, "url": "http://127.0.0.1:8080/agent/upload"}, target)
+            json.dump({"token": token, "url": "http://127.0.0.1:8080/agent/upload",
+                       "diagnostics_root": str(getattr(job, "diagnostic_root", None) or root)}, target)
         return token
 
     def end(self, token):

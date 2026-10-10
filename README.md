@@ -95,11 +95,11 @@ The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after chan
 
 Only explicit OneBot `at` segments addressed to the bot trigger work. Private messages, untrusted groups, @all, text resembling an @mention, and the bot's own messages do not trigger tasks. Live messages more than five minutes old are archived without triggering. Trigger deduplication persists for seven days.
 
-Each ordinary request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
+Each ordinary request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, C++17 via g++, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
 
 Replies default to 1–3 short sentences, usually under 300 Chinese characters, in the requester's language. Markdown is converted to plain text, preserving URLs and code contents. Replies have a hard 1800-character cap.
 
-Foreground requests run one at a time, with up to five queued requests. A separate worker can execute one approved background DSH occurrence concurrently. Further mentions are ignored while the queue is full. Image preparation is limited to 60 seconds, followed by a five-minute DSH deadline. Timeouts and failures receive a short error reply. Restarting loses in-memory queued work; ambiguous send failures are not retried automatically to avoid duplicates.
+Foreground requests run one at a time, with up to five queued requests. A separate worker can execute one approved background DSH occurrence concurrently. Further mentions are ignored while the queue is full. Image preparation is limited to 60 seconds, followed by a five-minute DSH deadline. Foreground timeouts offer a saved background continuation; other failures receive a short error reply. Restarting loses in-memory queued work; ambiguous send failures are not retried automatically to avoid duplicates.
 
 ## Status command
 
@@ -223,6 +223,24 @@ A one-shot job starts immediately after confirmation unless `--delay SECONDS` is
 SQLite stores proposals, confirmations, pending jobs, run outcomes and timing. State lives in `state/seen.sqlite3`; occurrence files are under `state/groups/<group>/background/<job>/runs/<occurrence>/{workspace,home}`. The history helper still reads the same group archive, while upload/messaging capability files belong to each isolated run. A later occurrence gets fresh group context, not a reused DSH session; put the necessary task instructions into the job prompt.
 
 Pending proposals/jobs survive restarts. Work interrupted while running is marked `interrupted` and is not automatically replayed, because tools may already have produced effects. Failed or uncertain results pause the job. List jobs to inspect their last result and request a replacement explicitly when appropriate. Offline/overlapping slots are skipped rather than producing a burst of catch-up messages. Cancellation terminates the running process group and prevents future occurrences; it cannot recall an in-flight or already-sent message. Removing group trust cancels its pending/running jobs. A job's requester must confirm it; any trusted member who can trigger the bot may list/cancel jobs in that group.
+
+## Timeout continuation and background instructions
+
+After a foreground timeout, the bridge saves a pending continuation and asks the original requester whether to continue in the background for up to twelve hours. Nothing starts until confirmation. @mention the bot with `/continue JOB_ID` to confirm or `/cancel JOB_ID` to cancel; these exact commands bypass DSH and the foreground queue. Natural-language confirmation can also be handled by the foreground agent through `background.py confirm`. Group trust, same requester, later-message confirmation and deduplication still apply.
+
+A continuation adopts the recorded DSH session with `--session-id` in the exact original working directory and DSH home. Files and persisted session events remain available. The timed-out process is stopped: this is continuation from saved progress, not a suspended CPU/network operation. A currently running tool or model request may be interrupted; inspect results before repeating external effects. If no session ID was recorded, the offer says so and continuation uses saved files and original context in a fresh session. Missing/corrupt recorded sessions fail explicitly rather than silently restarting the task.
+
+DSH requires the same cwd for adoption. The bridge therefore reserves a timed-out foreground workspace for that continuation and rotates subsequent ordinary requests to a new persistent `state/groups/<group>/foreground/<id>/{workspace,home}`. The old files stay in their original location; they are not copied into the new workspace. This prevents background and foreground work sharing writable files or request grants. Workspace selection, proposals and resume metadata survive restarts. Foreground diagnostics remain under the group's `diagnostics/`; continuation diagnostics use the background occurrence directory. Pending continuations count toward the existing job quotas.
+
+The original requester can send corrections to an existing pending or running job:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/background.py steer JOB_ID --key use-cpp --message 'Use C++17 instead of Python; compile and test it'
+```
+
+The foreground agent should list jobs, identify the intended job and steer it rather than create a duplicate. Ambiguous targets require clarification. A pending proposal still needs confirmation; an explicit correction to an already-authorized job needs no new launch permission. Only the original requester in the same group may steer, and background children cannot steer other tasks. C++17 compilation is installed in the image via `g++`.
+
+Instructions are persisted and idempotent per request/key (up to 20 instructions per job, 2000 characters each). `queued` means saved for delivery; `applied` means included in a runner attempt, not proof that the model has obeyed. List returns the instruction history. During execution, the bridge stops and reaps the current process group, then adopts the same saved session/workspace with the new instructions. Newer corrections take precedence. This does not reset the occurrence deadline or create another job, and only the updated run's final result is delivered. It cannot recall earlier uploads/progress messages or an already-in-flight final delivery. Completed/cancelled jobs and jobs already delivering their final result reject new instructions. On container restart, running jobs still become interrupted and require operator review; pending instructions remain saved.
 
 ## Model limits and failure diagnostics
 
