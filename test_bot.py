@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from aiohttp import ClientSession, WSServerHandshakeError, web
 from bot import Bridge, prompt_for
+from history import query
 from status_report import last_run, resources, status_report
 
 
@@ -27,6 +28,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await asyncio.gather(*self.bridge.receipt_tasks, return_exceptions=True)
+        tasks = list(self.bridge.transcription_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if not self.bridge.worker_task:
             self.bridge.db.close()
         self.tmp.cleanup()
@@ -72,6 +77,40 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.config.write_text("invalid")
         await self.bridge.event(self.event(6))
         self.assertTrue(self.bridge.queue.empty())
+
+    async def test_voice_is_transcribed_and_added_to_trigger_and_history(self):
+        calls = []
+        async def api(action, params, **kwargs):
+            calls.append((action, params))
+            if action == 'fetch_ptt_text':
+                return {'text': '请用 C++ 实现并测试'}
+            return {'result': True}
+        self.bridge.api = api
+        event = self.event(77)
+        event['message'][0] = {'type': 'record', 'data': {'file': 'voice.amr'}}
+        await self.bridge.event(event)
+        await asyncio.gather(*self.bridge.transcription_tasks.values())
+        job = self.bridge.queue.get_nowait()
+        await self.bridge.prepare_transcriptions(job)
+        self.assertEqual([c[0] for c in calls], ['fetch_ptt_text'])
+        self.assertIn('请用 C++ 实现并测试', job.text)
+        self.assertIn('请用 C++ 实现并测试', self.bridge.archive(123456789).recent()[0]['text'])
+        self.assertEqual(self.bridge.archive(123456789).transcription('77')['status'], 'ready')
+        result = query(self.bridge.archive(123456789).path, message_id='77')
+        self.assertIn('请用 C++ 实现并测试', result['messages'][0]['text'])
+
+    async def test_voice_failure_is_bounded_and_keeps_audio_placeholder(self):
+        async def api(action, params, **kwargs):
+            raise RuntimeError('transcription unavailable')
+        self.bridge.api = api
+        event = self.event(78)
+        event['message'][0] = {'type': 'record', 'data': {'file': 'voice.silk'}}
+        await self.bridge.event(event)
+        await asyncio.gather(*self.bridge.transcription_tasks.values())
+        job = self.bridge.queue.get_nowait()
+        await self.bridge.prepare_transcriptions(job)
+        self.assertIn('[record]', job.text)
+        self.assertEqual(self.bridge.archive(123456789).transcription('78')['status'], 'unavailable')
 
     async def test_only_explicit_self_mention_and_recent_events(self):
         event = self.event(1)

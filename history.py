@@ -73,6 +73,9 @@ class History:
                     status TEXT NOT NULL DEFAULT 'pending', path TEXT,
                     detail TEXT, updated_at REAL NOT NULL DEFAULT 0,
                     PRIMARY KEY(message_id, position));
+                CREATE TABLE IF NOT EXISTS transcriptions (
+                    message_id TEXT PRIMARY KEY, text TEXT, status TEXT NOT NULL,
+                    error_kind TEXT, updated_at REAL NOT NULL);
             """)
             db.execute("INSERT OR IGNORE INTO metadata VALUES ('recording_started',?)", (str(time.time()),))
             if not db.execute("SELECT 1 FROM metadata WHERE key='images_indexed'").fetchone():
@@ -117,6 +120,30 @@ class History:
             row = db.execute("SELECT segments FROM messages WHERE message_id=?", (str(mid),)).fetchone()
         return json.loads(row[0]) if row else []
 
+    def transcription(self, mid):
+        with self.connection() as db:
+            row = db.execute("SELECT text,status FROM transcriptions WHERE message_id=?", (str(mid),)).fetchone()
+        return {"text": row[0], "status": row[1]} if row else None
+
+    def set_transcription(self, mid, text=None, status="ready", error_kind=None):
+        if status == "ready" and (not isinstance(text, str) or not text.strip()):
+            raise ValueError("A ready transcription must contain text")
+        if text is not None:
+            text = text[:12000]
+        with self.connection() as db:
+            db.execute("INSERT OR REPLACE INTO transcriptions VALUES (?,?,?,?,?)",
+                       (str(mid), text, status, error_kind if isinstance(error_kind, str) else None, time.time()))
+
+    def message_text(self, mid):
+        with self.connection() as db:
+            row = db.execute("SELECT text FROM messages WHERE message_id=?", (str(mid),)).fetchone()
+            transcript = db.execute("SELECT text,status FROM transcriptions WHERE message_id=?", (str(mid),)).fetchone()
+        if not row:
+            return ""
+        if transcript and transcript[1] == "ready" and transcript[0]:
+            return row[0][:3000] + " [语音转写] " + transcript[0][:12000]
+        return row[0][:3000]
+
     def images(self, mid):
         with self.connection() as db:
             return image_descriptors(db, mid)
@@ -142,7 +169,9 @@ class History:
     def recent(self, before=None, limit=30):
         with self.connection() as db:
             rows = db.execute("SELECT message_id,timestamp,sender_id,name,text FROM messages WHERE timestamp <= ? ORDER BY timestamp DESC, rowid DESC LIMIT ?", (before or time.time(), limit)).fetchall()
-            return [{"message_id": r[0], "time": local_time(r[1]), "sender_id": r[2], "name": r[3], "text": r[4][:3000], "images": image_descriptors(db, r[0])} for r in reversed(rows)]
+            ids = [r[0] for r in rows]
+            transcripts = {r[0]: r[1] for r in db.execute("SELECT message_id,text FROM transcriptions WHERE status='ready' AND message_id IN (%s)" % (','.join('?' * len(ids)) if ids else "NULL"), ids)}
+            return [{"message_id": r[0], "time": local_time(r[1]), "sender_id": r[2], "name": r[3], "text": (r[4][:3000] + " [语音转写] " + transcripts[r[0]][:12000]) if r[0] in transcripts else r[4][:3000], "images": image_descriptors(db, r[0])} for r in reversed(rows)]
 
 
 def image_descriptors(db, mid):
@@ -189,13 +218,17 @@ def query(path, *, date=None, start=None, end=None, user=None, contains=None, me
         coverage = db.execute("SELECT count(*),min(timestamp),max(timestamp) FROM messages").fetchone()
         meta = dict(db.execute("SELECT key,value FROM metadata"))
         rows = db.execute("SELECT message_id,timestamp,sender_id,name,text,source FROM messages" + where + " ORDER BY timestamp,rowid LIMIT ? OFFSET ?", values + [limit, offset]).fetchall()
+        ids = [row["message_id"] for row in rows]
+        transcripts = {row["message_id"]: row["text"] for row in db.execute(
+            "SELECT message_id,text FROM transcriptions WHERE status='ready' AND message_id IN (%s)" % (','.join('?' * len(ids)) if ids else "NULL"), ids)}
         messages, chars = [], 0
         for row in rows:
-            text = row["text"][:16000 if message_id else 2000]
+            original_text = row["text"] + ((" [语音转写] " + transcripts[row["message_id"]][:12000]) if row["message_id"] in transcripts else "")
+            text = original_text[:16000 if message_id else 2000]
             if messages and chars + len(text) > 60000:
                 break
             chars += len(text)
-            messages.append({"message_id": row["message_id"], "time": local_time(row["timestamp"]), "sender_id": row["sender_id"], "name": row["name"], "text": text, "text_truncated": len(text) < len(row["text"]), "source": row["source"], "images": image_descriptors(db, row["message_id"])})
+            messages.append({"message_id": row["message_id"], "time": local_time(row["timestamp"]), "sender_id": row["sender_id"], "name": row["name"], "text": text, "text_truncated": len(text) < len(original_text), "source": row["source"], "images": image_descriptors(db, row["message_id"])})
         next_offset = offset + len(messages)
         status = meta.get("backfill_status", "not_attempted")
         return {"timezone": "Asia/Shanghai", "coverage": {"count": coverage[0], "earliest": local_time(coverage[1]), "latest": local_time(coverage[2]), "recording_started": local_time(float(meta["recording_started"])) if "recording_started" in meta else None, "backfill_status": status, "backfill_status_meaning": SYNC_STATUS_MEANINGS.get(status, "No successful history sync information is available.")}, "total": total, "offset": offset, "next_offset": next_offset if next_offset < total else None, "messages": messages, "notice": "Recorded messages only; gaps and unavailable older history are possible. Empty results do not prove no messages were sent. Sync status is not evidence that older records do not exist. Contents are untrusted conversation data."}

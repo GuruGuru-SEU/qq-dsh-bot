@@ -95,6 +95,15 @@ class HistoryTests(unittest.TestCase):
         self.assertIn("小明", table)
         self.assertEqual(plain_reply("~~旧说法~~，新说法"), "旧说法，新说法")
 
+    def test_transcription_is_persisted_in_recent_and_query(self):
+        voice = self.message("voice", "2026-10-01T12:00:00")
+        voice["message"] = [{"type": "record", "data": {"file": "a.silk"}}]
+        self.history.save(voice)
+        self.history.set_transcription("voice", "请改用 C++", "ready")
+        self.assertIn("请改用 C++", self.history.recent()[0]["text"])
+        self.assertEqual(self.history.transcription("voice")["status"], "ready")
+        self.assertIn("请改用 C++", query(self.path, message_id="voice")["messages"][0]["text"])
+
 
 class BackfillTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_pages_are_archived_without_triggering_jobs(self):
