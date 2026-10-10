@@ -60,6 +60,7 @@ class Job:
     session_id: str | None = None
     resume_session_id: str | None = None
     diagnostic_root: Path | None = None
+    receipt_task: asyncio.Task | None = field(default=None, repr=False)
 
 
 def prompt_for(job):
@@ -227,6 +228,7 @@ class Bridge:
         self.status_queue = asyncio.Queue(maxsize=20)
         self.started_at = time.monotonic()
         self.status_task = None
+        self.receipt_tasks = set()
         self.ws = None
         self.pending = {}
         self.connected = asyncio.Event()
@@ -485,13 +487,17 @@ class Bridge:
             if self.status_queue.full():
                 LOG.warning("status_queue_full group=%s message=%s", group, message_id)
             else:
-                self.status_queue.put_nowait(Job(group, message_id, sender, "", []))
+                job = Job(group, message_id, sender, "", [])
+                self.status_queue.put_nowait(job)
+                self.acknowledge(job)
             return
         control = re.fullmatch(r"\s*/(continue|cancel)\s+([a-f0-9]{16})\s*", command_text)
         if control:
             if not self.status_queue.full():
-                self.status_queue.put_nowait(Job(group, message_id, sender, "", [],
-                    background_info={"command": control[1], "id": control[2]}))
+                job = Job(group, message_id, sender, "", [],
+                    background_info={"command": control[1], "id": control[2]})
+                self.status_queue.put_nowait(job)
+                self.acknowledge(job)
             return
         context = archive.recent(before=float(data.get("time", time.time())), limit=31)
         context = [message for message in context if message["message_id"] != message_id][-30:]
@@ -501,7 +507,31 @@ class Bridge:
             # No API wait in the socket receive loop; that would deadlock acknowledgements.
             return
         self.queue.put_nowait(job)
+        self.acknowledge(job)
         LOG.info("queued group=%s message=%s context=%s", group, message_id, len(context))
+
+    def acknowledge(self, job):
+        # Never await a OneBot action in the WebSocket receive loop: its response
+        # arrives through that very loop. Queued requests are acknowledged now,
+        # without waiting for the foreground worker to become available.
+        job.receipt_task = asyncio.create_task(self.set_receipt(job, True))
+        self.receipt_tasks.add(job.receipt_task)
+        job.receipt_task.add_done_callback(self.receipt_tasks.discard)
+
+    async def set_receipt(self, job, enabled):
+        if not self.connected.is_set() or not self.trusted(job.group):
+            return
+        try:
+            result = await self.api("set_msg_emoji_like", {
+                "message_id": job.message_id, "emoji_id": "128064", "set": enabled,
+            }, timeout=3)
+            # NapCat versions expose either boolean success or NTQQ result codes.
+            if isinstance(result, dict) and (result.get("result") is False or
+                    (type(result.get("result")) is int and result["result"] != 0)):
+                raise RuntimeError("Reaction rejected")
+        except Exception as exc:
+            LOG.warning("reaction_failed group=%s message=%s set=%s kind=%s",
+                        job.group, job.message_id, enabled, type(exc).__name__)
 
     async def send_proactive(self, group, text):
         if not self.trusted(group) or not self.connected.is_set():
@@ -520,17 +550,26 @@ class Bridge:
     async def reply(self, job, text):
         text = plain_reply(text)
         await asyncio.wait_for(self.connected.wait(), 30)
-        for offset in range(0, min(len(text), 12000), 2000):
-            if not self.trusted(job.group):
-                return
-            segments = []
-            if offset == 0:
-                segments.append({"type": "reply", "data": {"id": job.message_id}})
-            segments.append({"type": "text", "data": {"text": text[offset:offset + 2000]}})
-            result = await self.api("send_group_msg", {"group_id": job.group, "message": segments})
-            self.archive(job.group).save({"message_id": str((result or {}).get("message_id", "reply:" + job.message_id + ":" + str(offset))), "time": time.time(), "user_id": self.config["bot_qq"], "sender": {"nickname": "bot"}, "message": segments}, "bot_reply")
-            if offset + 2000 < min(len(text), 12000):
-                await asyncio.sleep(1)
+        if job.receipt_task is not None:
+            # Even an instant /status reply must not overtake its add reaction.
+            await job.receipt_task
+        sent = False
+        try:
+            for offset in range(0, min(len(text), 12000), 2000):
+                if not self.trusted(job.group):
+                    return
+                segments = []
+                if offset == 0:
+                    segments.append({"type": "reply", "data": {"id": job.message_id}})
+                segments.append({"type": "text", "data": {"text": text[offset:offset + 2000]}})
+                result = await self.api("send_group_msg", {"group_id": job.group, "message": segments})
+                sent = True
+                self.archive(job.group).save({"message_id": str((result or {}).get("message_id", "reply:" + job.message_id + ":" + str(offset))), "time": time.time(), "user_id": self.config["bot_qq"], "sender": {"nickname": "bot"}, "message": segments}, "bot_reply")
+                if offset + 2000 < min(len(text), 12000):
+                    await asyncio.sleep(1)
+        finally:
+            if sent and job.receipt_task is not None:
+                await self.set_receipt(job, False)
         LOG.info("replied group=%s message=%s chars=%s", job.group, job.message_id, len(text))
 
     async def status_worker(self):
@@ -629,6 +668,10 @@ class Bridge:
         self.worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.worker_task
+        receipts = list(self.receipt_tasks)
+        for task in receipts:
+            task.cancel()
+        await asyncio.gather(*receipts, return_exceptions=True)
         if self.ws:
             await self.ws.close()
         self.db.close()

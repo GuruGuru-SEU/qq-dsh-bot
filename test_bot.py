@@ -17,6 +17,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.config = Path(self.tmp.name) / "config.json"
         self.config.write_text(json.dumps({"trusted_groups": [123456789], "bot_qq": 12345, "history_sync": False}))
         self.jobs = []
+        self.reactions = []
 
         async def runner(job):
             self.jobs.append(job)
@@ -25,6 +26,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.bridge = Bridge(self.config, self.tmp.name, "t" * 40, runner)
 
     async def asyncTearDown(self):
+        await asyncio.gather(*self.bridge.receipt_tasks, return_exceptions=True)
         if not self.bridge.worker_task:
             self.bridge.db.close()
         self.tmp.cleanup()
@@ -36,6 +38,21 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         return {"post_type": "message", "message_type": "group", "self_id": 12345,
                 "group_id": group, "user_id": sender, "message_id": mid,
                 "time": time.time(), "message": segments, "sender": {"nickname": "Alice"}}
+
+    async def receive_non_reaction(self, ws):
+        while True:
+            action = await ws.receive_json(timeout=3)
+            if action['action'] != 'set_msg_emoji_like':
+                return action
+            self.assertEqual(action['params']['emoji_id'], '128064')
+            self.reactions.append(action['params'])
+            await ws.send_json({'status': 'ok', 'retcode': 0, 'echo': action['echo'], 'data': {'result': True}})
+
+    async def receive_unset(self, ws, mid):
+        action = await ws.receive_json(timeout=3)
+        self.assertEqual(action['action'], 'set_msg_emoji_like')
+        self.assertEqual(action['params'], {'message_id': str(mid), 'emoji_id': '128064', 'set': False})
+        await ws.send_json({'status': 'ok', 'retcode': 0, 'echo': action['echo'], 'data': {'result': True}})
 
     async def test_filter_context_reload_and_dedup(self):
         await self.bridge.event(self.event(1, group=999))
@@ -87,12 +104,14 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(self.bridge.connected.wait(), 3)
                     await ws.send_json(self.event(10, mention=False))
                     await ws.send_json(self.event(11))
-                    reply = await ws.receive_json(timeout=3)
+                    reply = await self.receive_non_reaction(ws)
+                    self.assertEqual(self.reactions, [{'message_id': '11', 'emoji_id': '128064', 'set': True}])
                     self.assertEqual(reply["action"], "send_group_msg")
                     self.assertEqual(reply["params"]["group_id"], 123456789)
                     self.assertEqual(reply["params"]["message"][0], {"type": "reply", "data": {"id": "11"}})
                     self.assertEqual(reply["params"]["message"][1]["data"]["text"], "VERIFIED_REPLY")
                     await ws.send_json({"status": "ok", "retcode": 0, "echo": reply["echo"], "data": {"message_id": 12}})
+                    await self.receive_unset(ws, 11)
                     await asyncio.wait_for(self.bridge.queue.join(), 3)
                     self.assertEqual(len(self.jobs), 1)
                     self.assertEqual(len(self.jobs[0].context), 1)
@@ -226,7 +245,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     for mid in range(21, 26):
                         await ws.send_json(self.event(mid))
                     await ws.send_json(self.status_event(26))
-                    reply = await ws.receive_json(timeout=3)
+                    reply = await self.receive_non_reaction(ws)
+                    self.assertEqual({r['message_id'] for r in self.reactions}, {str(i) for i in range(20, 27)})
+                    self.assertTrue(all(r['set'] for r in self.reactions))
                     self.assertEqual(reply['action'], 'send_group_msg')
                     self.assertEqual(reply['params']['message'][0]['data']['id'], '26')
                     text = reply['params']['message'][1]['data']['text']
@@ -235,6 +256,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn('处理中', text)
                     self.assertIn('本次未调用 LLM 或 DSH', text)
                     await ws.send_json({'status': 'ok', 'retcode': 0, 'echo': reply['echo'], 'data': {'message_id': 27}})
+                    await self.receive_unset(ws, 26)
                     await asyncio.wait_for(self.bridge.status_queue.join(), 3)
                     self.assertEqual(len(self.jobs), 1)
                     self.assertEqual(self.bridge.queue.qsize(), 5)
@@ -265,6 +287,64 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             worker.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await worker
+
+    async def test_receipts_only_for_accepted_fresh_mentions_once(self):
+        self.bridge.connected.set()
+        calls = []
+        async def api(action, params, **kwargs):
+            calls.append((action, params))
+            return {'result': True}
+        self.bridge.api = api
+        await self.bridge.event(self.event(1, group=999))
+        await self.bridge.event(self.event(2, mention=False))
+        await self.bridge.event(self.event(3, sender=12345))
+        stale = self.event(4)
+        stale['time'] -= 1000
+        await self.bridge.event(stale)
+        for mid in range(10, 16):
+            await self.bridge.event(self.event(mid))
+        await self.bridge.event(self.event(10))
+        await asyncio.gather(*self.bridge.receipt_tasks)
+        self.assertEqual([c[1]['message_id'] for c in calls], [str(i) for i in range(10, 15)])
+        self.assertTrue(all(c[0] == 'set_msg_emoji_like' and c[1]['set'] for c in calls))
+
+    async def test_reaction_failures_do_not_prevent_reply(self):
+        self.bridge.connected.set()
+        calls = []
+        async def api(action, params, **kwargs):
+            calls.append((action, params))
+            if action == 'set_msg_emoji_like':
+                raise asyncio.TimeoutError()
+            return {'message_id': 99}
+        self.bridge.api = api
+        await self.bridge.event(self.event(1))
+        job = self.bridge.queue.get_nowait()
+        await self.bridge.reply(job, 'done')
+        self.assertEqual([c[0] for c in calls], ['set_msg_emoji_like', 'send_group_msg', 'set_msg_emoji_like'])
+        self.assertFalse(calls[-1][1]['set'])
+
+    async def test_failed_reply_keeps_receipt_but_archive_failure_clears_it(self):
+        self.bridge.connected.set()
+        calls = []
+        async def api(action, params, **kwargs):
+            calls.append((action, params))
+            if action == 'send_group_msg':
+                raise ConnectionError('Send not confirmed')
+            return {'result': True}
+        self.bridge.api = api
+        await self.bridge.event(self.event(1))
+        job = self.bridge.queue.get_nowait()
+        with self.assertRaises(ConnectionError):
+            await self.bridge.reply(job, 'done')
+        self.assertEqual([c[0] for c in calls], ['set_msg_emoji_like', 'send_group_msg'])
+        async def sent(action, params, **kwargs):
+            calls.append((action, params))
+            return {'message_id': 99}
+        self.bridge.api = sent
+        with patch.object(self.bridge.archive(job.group), 'save', side_effect=OSError), self.assertRaises(OSError):
+            await self.bridge.reply(job, 'done')
+        self.assertEqual(calls[-1][0], 'set_msg_emoji_like')
+        self.assertFalse(calls[-1][1]['set'])
 
     async def test_status_queue_bound_and_trust_revocation(self):
         for mid in range(30):

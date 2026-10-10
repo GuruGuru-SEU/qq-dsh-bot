@@ -101,6 +101,12 @@ Replies default to 1–3 short sentences, usually under 300 Chinese characters, 
 
 Foreground requests run one at a time, with up to five queued requests. A separate worker can execute one approved background DSH occurrence concurrently. Further mentions are ignored while the queue is full. Image preparation is limited to 60 seconds, followed by a five-minute DSH deadline. Foreground timeouts offer a saved background continuation; other failures receive a short error reply. Restarting loses in-memory queued work; ambiguous send failures are not retried automatically to avoid duplicates.
 
+## Received-message reaction
+
+Accepted @mentions in trusted groups get an 👀 reaction immediately, including queued requests and `/status`, `/continue` and `/cancel` commands. The bridge calls NapCat's [`set_msg_emoji_like`](https://napcat.apifox.cn/226659104e0) with Unicode emoji ID `128064` and `set=true`, then `set=false` after the quoted reply is acknowledged. Error replies and timeout continuation offers also clear the reaction. Background progress/final messages do not add reactions to unrelated messages.
+
+Reaction calls run outside the WebSocket receive loop, with a three-second timeout and no model involvement. Adding the reaction runs alongside normal processing; fast replies wait for that attempt to finish so add/remove cannot be sent in reverse order. Reaction errors are logged and never prevent an answer. Ignored, duplicate, stale, untrusted and queue-overflow messages are not marked received. Failed/unconfirmed replies keep the receipt. Reactions are best-effort: a disconnection, failed removal or container restart can leave an old reaction visible; pending reaction operations are not persisted or retried automatically.
+
 ## Status command
 
 In a trusted group, @mention the bot with `/status` anywhere in the message text (case-sensitive), for example `@bot 请检查 /status 现在怎么样`. The bridge replies directly with a plain-text status snapshot, without starting DSH, calling an LLM, preparing images for a model, or executing other instructions in that message. The usual real @mention, group trust, freshness and deduplication checks still apply. Quoted messages and attachment metadata do not trigger the command.
