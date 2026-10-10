@@ -12,7 +12,7 @@ jobs:
       - name: Build standalone image
         run: docker build -t qq-dsh-bot:test .
       - name: Test as the unprivileged runtime user
-        run: docker run --rm --entrypoint /opt/bot-venv/bin/python qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload test_messaging test_background
+        run: docker run --rm --entrypoint /opt/bot-venv/bin/python qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload test_messaging test_background test_runtime
       - name: Validate Compose configuration
         env:
           DEEPSEEK_API_KEY: ci-placeholder

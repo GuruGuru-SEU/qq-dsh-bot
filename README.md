@@ -203,18 +203,35 @@ The foreground agent uses:
 
 ```sh
 /opt/bot-venv/bin/python /opt/bot/background.py propose --key three-updates --every 60 --count 3 --prompt 'Produce one brief message for this occurrence'
-/opt/bot-venv/bin/python /opt/bot/background.py propose --key analysis --timeout 900 --prompt 'Analyze the requested data and report the result'
+/opt/bot-venv/bin/python /opt/bot/background.py propose --key analysis --timeout 43200 --prompt 'Analyze the requested data and report the result'
 /opt/bot-venv/bin/python /opt/bot/background.py list
 # Only after the requesting user explicitly agrees in a later @mention:
 /opt/bot-venv/bin/python /opt/bot/background.py confirm JOB_ID
 /opt/bot-venv/bin/python /opt/bot/background.py cancel JOB_ID
 ```
 
-A one-shot job starts immediately after confirmation unless `--delay SECONDS` is set. Repeated jobs default to delaying the first run by `--every SECONDS`. Limits are 1–60 occurrences, intervals of 60–86400 seconds, a seven-day total span, three pending/running jobs per group, twenty globally, and three proposals per triggering request. Per-occurrence runtime defaults to 300 seconds, up to 900 with `--timeout`. One background DSH process runs globally alongside the one foreground process, inside the existing container and its resource limits. Jobs never overlap their own occurrences or recursively spawn children. Background sessions may issue up to two useful progress updates, reserving the third message for their automatically posted final answer; all proactive sends share the existing per-group rate limit.
+A one-shot job starts immediately after confirmation unless `--delay SECONDS` is set. Repeated jobs default to delaying the first run by `--every SECONDS`. Limits are 1–60 occurrences, intervals of 60–86400 seconds, a seven-day total span, three pending/running jobs per group, twenty globally, and three proposals per triggering request. Per-occurrence runtime defaults to 300 seconds, up to 43200 seconds (12 hours) with `--timeout`. One background DSH process runs globally alongside the one foreground process, inside the existing container and its resource limits. Jobs never overlap their own occurrences or recursively spawn children. Background sessions may issue up to two useful progress updates, reserving the third message for their automatically posted final answer; all proactive sends share the existing per-group rate limit.
 
 SQLite stores proposals, confirmations, pending jobs, run outcomes and timing. State lives in `state/seen.sqlite3`; occurrence files are under `state/groups/<group>/background/<job>/runs/<occurrence>/{workspace,home}`. The history helper still reads the same group archive, while upload/messaging capability files belong to each isolated run. A later occurrence gets fresh group context, not a reused DSH session; put the necessary task instructions into the job prompt.
 
 Pending proposals/jobs survive restarts. Work interrupted while running is marked `interrupted` and is not automatically replayed, because tools may already have produced effects. Failed or uncertain results pause the job. List jobs to inspect their last result and request a replacement explicitly when appropriate. Offline/overlapping slots are skipped rather than producing a burst of catch-up messages. Cancellation terminates the running process group and prevents future occurrences; it cannot recall an in-flight or already-sent message. Removing group trust cancels its pending/running jobs. A job's requester must confirm it; any trusted member who can trigger the bot may list/cancel jobs in that group.
+
+## Model limits and failure diagnostics
+
+The main model has a 32768-token response budget, including reasoning, with high reasoning effort. The short QQ reply policy is independent of that budget. Foreground work retains its five-minute deadline; approved background occurrences can request up to twelve hours. Longer runtime does not remove the model's per-response token limit.
+
+If DSH ends a turn with `max-tokens`, the bot explains that it exhausted the reasoning/output budget before completing an answer. It does not pretend a partial output is complete or automatically repeat tool actions. Background jobs retain this specific failure reason in their last result and pause.
+
+Every DSH run writes structured `dsh_result` metadata to container logs and private JSON files in `<run-root>/diagnostics/`. A foreground run's root is `state/groups/<group>`; each background occurrence uses its isolated run root. Records include session/message identity, elapsed time, timeout, process exit code, stop reason, available per-step token totals and the last step's usage. `usage_steps` versus `step_count` identifies missing usage reports; absent values mean unreported, not zero. They exclude prompts, answers, reasoning, raw errors and stderr content. Stderr is drained and only its byte count is recorded. Atomic, mode-600 JSON files survive container recreation; `last.json` refers to the last finished run, while message-ID hashes retain individual records.
+
+From the current workspace, DSH can inspect a prior failure using:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/diagnostics.py --message-id TRIGGER_MESSAGE_ID
+/opt/bot-venv/bin/python /opt/bot/diagnostics.py
+```
+
+Records start with this version; earlier failures still require inspecting private DSH session logs. Keep these diagnostics with private state backups.
 
 ## Operations and migration
 
@@ -243,7 +260,7 @@ The tests use synthetic messages and a simulated OneBot server. They do not call
 ```sh
 docker build -t qq-dsh-bot:test .
 docker run --rm --entrypoint /opt/bot-venv/bin/python \
-  qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload test_messaging test_background
+  qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload test_messaging test_background test_runtime
 ```
 
 GitHub Actions builds the standalone image, runs the tests as the unprivileged runtime user, and validates Compose configuration.

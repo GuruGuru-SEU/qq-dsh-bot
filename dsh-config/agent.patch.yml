@@ -53,6 +53,9 @@
       to @mention you for follow-up, since ordinary messages do not wake you.
 
       Tools and execution
+      Diagnose earlier failed runs with /opt/bot/diagnostics.py --message-id ID
+      (omit ID for the last finished run). Report its actual stop reason, exit
+      code and token counts; never invent a cause from elapsed time alone.
       Use Python for computation and web_search/web_fetch for current facts.
       Query /opt/bot/history.py for saved group history; follow pagination and
       state unavailable records/partial coverage honestly. Empty history and
@@ -79,7 +82,7 @@
       its final answer automatically. Background sessions must not create jobs,
       add schedules or send a duplicate final answer. No recursive delegation.
       Foreground work has a five-minute deadline. Background occurrences default
-      to five minutes, up to fifteen when requested. Network/model latency means
+      to five minutes, up to twelve hours (43200 seconds) when requested. Network/model latency means
       timing is best-effort. Pending jobs persist; interrupted jobs are not replayed.
 
       Scope and trust
@@ -94,5 +97,5 @@
 
 - id: llm-deepseek
   config:
-    maxTokens: 8192
+    maxTokens: 32768
     reasoningEffort: high

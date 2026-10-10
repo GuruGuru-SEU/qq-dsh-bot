@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from aiohttp import web, ClientSession
+from diagnostics import DSHFailure
 from background import BackgroundService
 from bot import Bridge, Job, prompt_for
 from history import current_archive, current_workspace, query
@@ -100,6 +101,32 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         await self.fire(proposal['id'])
         self.assertEqual(len(self.calls), 1)
 
+    async def test_twelve_hour_timeout_is_accepted_and_used_by_worker(self):
+        result, _ = await self.create(timeout=43200)
+        actual_wait_for = asyncio.wait_for
+        timeouts = []
+        async def observed(awaitable, timeout):
+            timeouts.append(timeout)
+            return await actual_wait_for(awaitable, timeout)
+        with patch('background.asyncio.wait_for', side_effect=observed):
+            await self.fire(result['id'])
+        self.assertIn(43200, timeouts)
+        self.assertEqual(self.runs[0].timeout, 43200)
+        self.assertEqual(self.row(result['id'])['state'], 'completed')
+
+    async def test_background_retains_specific_token_exhaustion_reason(self):
+        result, _ = await self.create()
+        async def exhausted(job):
+            raise DSHFailure('max-tokens', 0)
+        self.bridge.runner = exhausted
+        await self.fire(result['id'])
+        row = self.row(result['id'])
+        self.assertEqual(row['state'], 'failed')
+        outcome = json.loads(row['last_result'])
+        self.assertEqual(outcome['reason'], 'max-tokens')
+        self.assertEqual(outcome['exit_code'], 0)
+        self.assertFalse(self.calls)
+
     async def test_three_runs_one_minute_apart_terminate_and_archive(self):
         result, body = await self.create(every=60, count=3)
         first = self.row(result['id'])['first_run']
@@ -125,7 +152,7 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post({'op': 'list'}, other))[1]['jobs'], [])
         self.assertEqual((await self.post({'op': 'cancel', 'id': result['id']}, other))[0], 400)
         self.assertEqual((await self.post({'op': 'list'}, 'bad'))[0], 403)
-        for fields in [{'every': 1, 'count': 3}, {'every': 60}, {'count': 0}, {'timeout': 901}, {'delay': -1}, {'count': True}, {'group_id': 987654321}, {'every': 86400, 'count': 60}, {'prompt': ''}]:
+        for fields in [{'every': 1, 'count': 3}, {'every': 60}, {'count': 0}, {'timeout': 43201}, {'delay': -1}, {'count': True}, {'group_id': 987654321}, {'every': 86400, 'count': 60}, {'prompt': ''}]:
             self.assertEqual((await self.post({**body, 'key': 'bad', **fields}))[0], 400, fields)
         await self.create('two')
         await self.create('three')
