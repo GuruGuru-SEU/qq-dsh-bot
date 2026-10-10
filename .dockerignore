@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!bot.py
+!test_bot.py
+!history.py
+!plaintext.py
+!test_history.py
+!media.py
+!test_media.py
+!requirements.txt

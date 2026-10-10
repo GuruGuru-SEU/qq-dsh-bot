@@ -1,0 +1,20 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  container-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build standalone image
+        run: docker build -t qq-dsh-bot:test .
+      - name: Test as the unprivileged runtime user
+        run: docker run --rm --entrypoint /opt/bot-venv/bin/python qq-dsh-bot:test -m unittest -v test_bot test_history test_media
+      - name: Validate Compose configuration
+        env:
+          DEEPSEEK_API_KEY: ci-placeholder
+          ONEBOT_TOKEN: ci-placeholder-token-at-least-32-characters
+        run: docker compose config --quiet
