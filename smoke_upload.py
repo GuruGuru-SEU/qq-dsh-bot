@@ -15,14 +15,16 @@ async def verify(bridge, group, result, uploaded_at):
     # NapCat can return a raw QQ UUID on upload, but random opaque IDs in listings.
     # Confirm the bot's matching recent file, then download and compare its bytes.
     for attempt in range(6):
-        listing = await bridge.api("get_group_root_files", {"group_id": str(group), "file_count": 1000}, timeout=30)
+        listing = await bridge.api("get_group_root_files", {"group_id": str(group), "file_count": 50}, timeout=30)
         for item in (listing or {}).get("files", []):
             timestamp = float(item.get("upload_time", 0))
             if timestamp > 100_000_000_000:
                 timestamp /= 1000
             if not (item.get("file_name") == "hello.txt" and int(item.get("file_size", item.get("size", 0))) == 23
                     and int(item.get("uploader", 0)) == bridge.config["bot_qq"]
-                    and abs(timestamp - uploaded_at) <= 60):
+                    # Some NapCat builds omit this timestamp (0); when present,
+                    # QQ's clock and the deployment host can differ by minutes.
+                    and (not timestamp or abs(timestamp - uploaded_at) <= 600)):
                 continue
             link = await bridge.api("get_group_file_url", {"group_id": str(group), "file_id": item["file_id"], "busid": item.get("busid", 102)}, timeout=30)
             async with ClientSession(timeout=ClientTimeout(total=30)) as client:
@@ -79,6 +81,9 @@ async def run(group, verify_file_id=None):
             result, uploaded_at = results[0], rows[0][1]
         await verify(bridge, group, result, uploaded_at)
     finally:
+        # Live group requests can arrive during verification. Finish accepted
+        # work before handing the connection back to the normal container.
+        await bridge.queue.join()
         if bridge.ws:
             await bridge.ws.close()
         await runner.cleanup()

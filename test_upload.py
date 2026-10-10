@@ -11,6 +11,7 @@ from aiohttp import ClientSession, web
 
 from bot import Bridge, Job
 from upload import OneBotError, UploadService, capability
+from smoke_upload import verify
 
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
@@ -29,6 +30,9 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_post("/agent/upload", self.bridge.uploads.handle)
         app.router.add_get("/transfers/{token}", self.bridge.uploads.download)
         app.router.add_get("/onebot", self.bridge.socket)
+        async def qq_file(request):
+            return web.Response(body=b"Hello from qq-dsh-bot!\n")
+        app.router.add_get("/qq-file", qq_file)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -160,6 +164,21 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             self.bridge.uploads.end(self.token)
             self.assertFalse(path.exists())
             self.assertEqual(capability(), {})
+
+    async def test_live_verification_handles_opaque_listing_ids_and_clock_skew(self):
+        calls = []
+        timestamp = 1180
+        async def api(action, params, timeout):
+            calls.append(action)
+            if action == "get_group_root_files":
+                return {"files": [{"file_id": "opaque-listing-id", "file_name": "hello.txt", "file_size": 23, "uploader": 12345, "upload_time": timestamp}]}
+            self.assertEqual(params["file_id"], "opaque-listing-id")
+            return {"url": self.url + "/qq-file"}
+        self.bridge.api = api
+        await verify(self.bridge, 123456789, {"file_id": "/raw-qq-id"}, 1000)
+        self.assertEqual(calls, ["get_group_root_files", "get_group_file_url"])
+        timestamp = 0
+        await verify(self.bridge, 123456789, {"file_id": "/raw-qq-id"}, 1000)
 
 
 if __name__ == "__main__":
