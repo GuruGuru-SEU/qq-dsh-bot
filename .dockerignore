@@ -8,3 +8,6 @@
 !media.py
 !test_media.py
 !requirements.txt
+!upload.py
+!smoke_upload.py
+!test_upload.py

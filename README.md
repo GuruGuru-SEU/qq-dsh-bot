@@ -1,6 +1,6 @@
 # qq-dsh-bot
 
-A small bridge from NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, and image input. The final answer is posted as a short plain-text reply.
+A small bridge from NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, and group-file uploads. The final answer is posted as a short plain-text reply.
 
 The default model is `deepseek-flash` (DeepSeek V4.1 Flash). DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs the pinned Harness version directly.
 
@@ -134,6 +134,31 @@ Downloads accept QQ media endpoints only, validate public DNS addresses and redi
 
 Messages and cached images have no automatic expiry. Monitor disk usage and back up the complete state directory.
 
+## Upload files to the group
+
+Ask the bot to deliver a file, for example: “下载这篇论文 PDF，上传到群文件” with its URL. DSH downloads or creates the file inside the current group workspace, then uses its bash tool to run:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/upload.py ./paper.pdf --name paper.pdf
+```
+
+The helper uploads to the triggering group only, with a limit of 20 MiB per file and three attempts per request. It is available only while DSH is processing that request. The bridge writes a private, temporary `.upload-request.json` beside the group's workspace and removes it when the run ends; the helper reads this grant because DSH scrubs credential-shaped environment variables from shell tools. Local files outside the group's workspace, symlink escapes, empty files and invalid filenames are rejected. No destination group or OneBot credentials are exposed to DSH.
+
+The bridge snapshots the bytes and serves them temporarily through an unguessable URL on the existing Docker network. NapCat fetches those bytes and calls its normal `upload_group_file` action. No new ports, NapCat filesystem mounts or NapCat configuration changes are required. The URL uses the Compose network alias `qq-dsh-bot:8080`, so NapCat must be on the shared network described above.
+
+The helper returns JSON with `status=uploaded` and a QQ file ID only after NapCat confirms it. A rejected upload returns `failed`; missing acknowledgement or file ID returns `unknown`, because the file may already have arrived. DSH must not claim success or blindly retry in those cases. Identical content/name within a triggering request reuses the persisted result, including failures and uncertain outcomes, to avoid duplicate sends. Audit results are stored in `state/seen.sqlite3`; a restart marks in-flight uploads as uncertain. QQ's actual account/group restrictions and group storage limits still apply.
+
+The default tests simulate NapCat and never upload to QQ. An explicit live smoke test is also provided; it uses DSH to create and upload one `hello.txt` and checks the matching file in the group root listing, then downloads it to verify its contents. Run it only when you want a real upload to the chosen trusted group. It temporarily runs the bridge in place of the normal container; wait for the normal bot to be idle first:
+
+```sh
+docker compose stop bot
+docker compose run --rm --use-aliases --entrypoint /opt/bot-venv/bin/python \
+  bot /opt/bot/smoke_upload.py --group YOUR_TRUSTED_GROUP_ID
+docker compose up -d
+```
+
+Restart the normal bot even if the test fails. If its result is uncertain, inspect QQ group files before repeating the test. No extra chat reply is sent for the smoke test. To verify an already acknowledged upload without sending another file, add `--verify-file-id ID` using the ID recorded by the helper.
+
 ## Operations and migration
 
 ```sh
@@ -161,7 +186,7 @@ The tests use synthetic messages and a simulated OneBot server. They do not call
 ```sh
 docker build -t qq-dsh-bot:test .
 docker run --rm --entrypoint /opt/bot-venv/bin/python \
-  qq-dsh-bot:test -m unittest -v test_bot test_history test_media
+  qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload
 ```
 
 GitHub Actions builds the standalone image, runs the tests as the unprivileged runtime user, and validates Compose configuration.
