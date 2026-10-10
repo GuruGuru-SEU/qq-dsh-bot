@@ -66,17 +66,21 @@ def status_report(bridge, group):
         'SELECT state,count(*) FROM background_jobs WHERE group_id=? GROUP BY state', (group,)))
     schedules = bridge.db.execute(
         "SELECT count(*) FROM schedules WHERE group_id=? AND state IN ('active','sending')", (group,)).fetchone()[0]
-    foreground = '空闲' if bridge.active is None else '处理中（已用' + elapsed(now - bridge.active_since) + '）'
+    active = bridge.active_by_group.get(group)
+    active_since = bridge.active_since_by_group.get(group)
+    foreground = '空闲' if active is None else '处理中（已用' + elapsed(now - active_since) + '）'
     connected = bridge.connected.is_set() and bridge.identity_ok
+    queue = bridge.queue_for(group)
+    worker = bridge.worker_tasks.get(group) or (bridge.worker_task if group == bridge.config['trusted_groups'][0] else None)
     return '\n'.join([
         '系统状态（' + datetime.now(ZONE).strftime('%Y-%m-%d %H:%M:%S') + ' 上海时间）',
         '桥接已运行：' + elapsed(now - bridge.started_at),
         'NapCat：' + ('已连接并验证' if connected else '未就绪'),
-        f"全局前台：{foreground}；排队 {bridge.queue.qsize()}/{bridge.queue.maxsize}",
+        f"本群前台：{foreground}；排队 {queue.qsize()}/{queue.maxsize}",
         '后台执行器：' + ('忙碌' if bridge.background.current_id else '空闲') + '；单次上限 12小时',
         f"本群后台任务：待确认 {background.get('awaiting_confirmation', 0)}，待运行 {background.get('active', 0)}，运行中 {background.get('running', 0)}",
         f"本群有效定时消息：{schedules}",
-        f"工作循环：前台{alive(bridge.worker_task)}，后台{alive(bridge.background_task)}，定时{alive(bridge.scheduler_task)}",
+        f"工作循环：本群前台{alive(worker)}，后台{alive(bridge.background_task)}，定时{alive(bridge.scheduler_task)}",
         *resources(bridge.state_path),
         last_run(bridge.state_path, group),
         '本次未调用 LLM 或 DSH。',

@@ -242,7 +242,13 @@ class Bridge:
         self.runner = runner
         self.state_path = Path(state_path)
         self.archives = {}
-        self.queue = asyncio.Queue(maxsize=5)
+        # Foreground work is serialized within a group, but groups have
+        # independent queues and workers so one busy conversation cannot hold
+        # another group's requests behind it.
+        self.queues = {}
+        self.queue = self.queue_for(self.config["trusted_groups"][0])
+        self.worker_tasks = {}
+        self.lifecycle_active = False
         self.status_queue = asyncio.Queue(maxsize=20)
         self.started_at = time.monotonic()
         self.status_task = None
@@ -256,6 +262,8 @@ class Bridge:
         self.last_event = None
         self.active = None
         self.active_since = None
+        self.active_by_group = {}
+        self.active_since_by_group = {}
         self.worker_task = None
         self.history_task = None
         self.media_task = None
@@ -274,6 +282,22 @@ class Bridge:
         self.messages = MessageService(self.db, self.uploads.grants, self.trusted,
                                        self.connected, self.send_proactive)
         self.background = BackgroundService(self, Job)
+
+    def queue_for(self, group):
+        queue = self.queues.get(group)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=100)
+            self.queues[group] = queue
+        return queue
+
+    def ensure_group_worker(self, group):
+        task = self.worker_tasks.get(group)
+        if task is None or task.done():
+            task = asyncio.create_task(self.worker(group))
+            self.worker_tasks[group] = task
+            if group == self.config["trusted_groups"][0]:
+                self.worker_task = task
+        return task
 
     def trusted(self, group):
         try:
@@ -527,11 +551,14 @@ class Bridge:
         context = archive.recent(before=float(data.get("time", time.time())), limit=31)
         context = [message for message in context if message["message_id"] != message_id][-30:]
         job = Job(group, message_id, sender, body, context)
-        if self.queue.full():
+        queue = self.queue_for(group)
+        if self.lifecycle_active:
+            self.ensure_group_worker(group)
+        if queue.full():
             LOG.warning("queue_full group=%s message=%s", group, message_id)
             # No API wait in the socket receive loop; that would deadlock acknowledgements.
             return
-        self.queue.put_nowait(job)
+        queue.put_nowait(job)
         self.acknowledge(job)
         LOG.info("queued group=%s message=%s context=%s", group, message_id, len(context))
 
@@ -603,16 +630,23 @@ class Bridge:
 
     async def prepare_transcriptions(self, job):
         archive = self.archive(job.group)
+        # Only transcribe the triggering message and the immutable context
+        # snapshot captured when it arrived. Do not pull in messages that
+        # arrived while an earlier job was running.
+        snapshot = list(job.context)
         ids = [job.message_id] if audio_message(archive.segments(job.message_id)) else []
-        for row in archive.recent(limit=30):
+        for row in snapshot:
             if audio_message(archive.segments(row["message_id"])):
                 ids.append(str(row["message_id"]))
         tasks = [task for mid in dict.fromkeys(ids)
                  if (task := self.schedule_transcription(job.group, mid)) is not None]
         if tasks:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), PTT_PREPARE_TIMEOUT)
-        job.context = [message for message in archive.recent(before=time.time(), limit=31)
-                       if message["message_id"] != str(job.message_id)][-30:]
+        # Refresh only those same message IDs so completed voice transcriptions
+        # appear without changing the ordering or membership of the context.
+        refreshed = {message["message_id"]: message
+                     for message in archive.recent(limit=max(100, len(snapshot) + 1))}
+        job.context = [refreshed.get(message["message_id"], message) for message in snapshot]
         job.text = archive.message_text(job.message_id) or job.text
 
     async def send_proactive(self, group, text):
@@ -675,11 +709,18 @@ class Bridge:
             finally:
                 self.status_queue.task_done()
 
-    async def worker(self):
+    async def worker(self, group=None):
+        if group is None:
+            group = self.config["trusted_groups"][0]
+        queue = self.queue_for(group)
         while True:
-            job = await self.queue.get()
-            self.active = job.message_id
-            self.active_since = time.monotonic()
+            job = await queue.get()
+            started = time.monotonic()
+            self.active_by_group[group] = job.message_id
+            self.active_since_by_group[group] = started
+            if self.active is None:
+                self.active = job.message_id
+                self.active_since = started
             try:
                 if not self.trusted(job.group):
                     continue
@@ -724,16 +765,26 @@ class Bridge:
                 # Never blindly resend after an ambiguous send timeout.
                 LOG.error("reply_failed group=%s message=%s kind=%s", job.group, job.message_id, type(exc).__name__)
             finally:
-                self.active = None
-                self.active_since = None
-                self.queue.task_done()
+                self.active_by_group.pop(group, None)
+                self.active_since_by_group.pop(group, None)
+                if self.active == job.message_id:
+                    if self.active_by_group:
+                        next_group, next_id = next(iter(self.active_by_group.items()))
+                        self.active = next_id
+                        self.active_since = self.active_since_by_group[next_group]
+                    else:
+                        self.active = None
+                        self.active_since = None
+                queue.task_done()
 
     async def health(self, request):
         ready = self.connected.is_set()
-        return web.json_response({"ready": ready, "bot_qq": self.config["bot_qq"], "trusted_groups": self.config["trusted_groups"], "queued": self.queue.qsize(), "active": self.active, "background_active": self.background.current_id, "last_event": self.last_event}, status=200 if ready else 503)
+        return web.json_response({"ready": ready, "bot_qq": self.config["bot_qq"], "trusted_groups": self.config["trusted_groups"], "queued": sum(queue.qsize() for queue in self.queues.values()), "queued_by_group": {str(group): queue.qsize() for group, queue in self.queues.items()}, "active": self.active, "active_by_group": {str(group): message_id for group, message_id in self.active_by_group.items()}, "background_active": self.background.current_id, "last_event": self.last_event}, status=200 if ready else 503)
 
     async def lifecycle(self, app):
-        self.worker_task = asyncio.create_task(self.worker())
+        self.lifecycle_active = True
+        for group in self.config["trusted_groups"]:
+            self.ensure_group_worker(group)
         self.status_task = asyncio.create_task(self.status_worker())
         self.media_task = asyncio.create_task(self.cache_images())
         self.scheduler_task = asyncio.create_task(self.messages.run())
@@ -751,9 +802,11 @@ class Bridge:
         self.media_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.media_task
-        self.worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.worker_task
+        self.lifecycle_active = False
+        workers = list(self.worker_tasks.values())
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         receipts = list(self.receipt_tasks)
         for task in receipts:
             task.cancel()

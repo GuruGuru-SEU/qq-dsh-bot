@@ -72,11 +72,22 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(999, self.bridge.archives)
         self.config.write_text(json.dumps({"trusted_groups": [123456789, 777], "bot_qq": 12345}))
         await self.bridge.event(self.event(5, group=777))
-        job = self.bridge.queue.get_nowait()
+        job = self.bridge.queue_for(777).get_nowait()
         self.assertEqual(job.context, [])
         self.config.write_text("invalid")
         await self.bridge.event(self.event(6))
         self.assertTrue(self.bridge.queue.empty())
+
+    async def test_each_mention_is_queued_and_context_stays_at_trigger_time(self):
+        await self.bridge.event(self.event(1))
+        await self.bridge.event(self.event(2))
+        await self.bridge.event(self.event(3))
+        jobs = [self.bridge.queue.get_nowait() for _ in range(3)]
+        self.assertEqual([job.message_id for job in jobs], ["1", "2", "3"])
+        await self.bridge.prepare_transcriptions(jobs[0])
+        self.assertEqual(jobs[0].context, [])
+        await self.bridge.prepare_transcriptions(jobs[2])
+        self.assertEqual([message["message_id"] for message in jobs[2].context], ["1", "2"])
 
     async def test_voice_is_transcribed_and_added_to_trigger_and_history(self):
         calls = []
