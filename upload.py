@@ -31,6 +31,7 @@ class Grant:
     group: int
     message_id: str
     workspace: Path
+    started: float = field(default_factory=time.monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 

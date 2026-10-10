@@ -11,3 +11,5 @@
 !upload.py
 !smoke_upload.py
 !test_upload.py
+!messaging.py
+!test_messaging.py

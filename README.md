@@ -1,6 +1,6 @@
 # qq-dsh-bot
 
-A small bridge from NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, and group-file uploads. The final answer is posted as a short plain-text reply.
+A small bridge from NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, group-file uploads, progress updates, and persistent message schedules. The final answer is posted as a short plain-text reply.
 
 The default model is `deepseek-flash` (DeepSeek V4.1 Flash). DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs the pinned Harness version directly.
 
@@ -95,7 +95,7 @@ The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after chan
 
 Only explicit OneBot `at` segments addressed to the bot trigger work. Private messages, untrusted groups, @all, text resembling an @mention, and the bot's own messages do not trigger tasks. Live messages more than five minutes old are archived without triggering. Trigger deduplication persists for seven days.
 
-Each request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages. Each group has its own persistent workspace and DSH home. The agent can use Python, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply; DSH is instructed not to send QQ messages itself.
+Each request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages. Each group has its own persistent workspace and DSH home. The agent can use Python, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
 
 Replies default to 1–3 short sentences, usually under 300 Chinese characters, in the requester's language. Markdown is converted to plain text, preserving URLs and code contents. Replies have a hard 1800-character cap.
 
@@ -159,6 +159,31 @@ docker compose up -d
 
 Restart the normal bot even if the test fails. If its result is uncertain, inspect QQ group files before repeating the test. No extra chat reply is sent for the smoke test. To verify an already acknowledged upload without sending another file, add `--verify-file-id ID` using the ID recorded by the helper.
 
+## Progress messages and scheduled reminders
+
+You can ask “明天 13:45 提醒大家开会”, “每天 13:45 发一条喝水提醒”, “看看本群的定时任务”, or “取消任务 ID”. The agent uses the current group's capability to call:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/messaging.py send --reason progress --key progress-1 --text '已完成数据整理，正在计算。'
+/opt/bot-venv/bin/python /opt/bot/messaging.py send --reason requested --key requested-1 --text '用户明确要求发送的消息'
+/opt/bot-venv/bin/python /opt/bot/messaging.py schedule --key reminder-1 --at '2026-10-11T13:45:00+08:00' --text '开会时间到了。'
+/opt/bot-venv/bin/python /opt/bot/messaging.py schedule --key daily-1 --cron '45 13 * * *' --text '记得喝水。'
+/opt/bot-venv/bin/python /opt/bot/messaging.py list
+/opt/bot-venv/bin/python /opt/bot/messaging.py cancel SCHEDULE_ID
+```
+
+The prompt says **不要滥用主动发言**: normal requests receive only a final answer. A useful progress update is allowed for genuinely long work after 60 seconds; additional updates must be at least 60 seconds apart. Immediate extra messages require an explicit triggering-user request (`--reason requested`). Scheduling or cancelling always requires an explicit triggering-user request. Old conversation, images, files and web pages do not authorize these actions. This intent rule is enforced through the agent prompt; the bridge additionally enforces group scope, active-session capabilities and numerical limits.
+
+The helper shares the private temporary capability used by uploads. It cannot choose another destination, emit CQ/at segments, or use OneBot credentials. There are at most three proactive sends and three schedule creations per request, ten active schedules per group, and three proactive/scheduled send attempts per group per minute. Normal final replies are separate. Keep a stable `--key` for each action; retries with the same key and arguments reuse the saved result. Identical keys with different content are rejected. The agent lists existing schedules before creating another and reports the actual schedule ID/time after confirmation. Any trusted group member who can trigger the bot can list/cancel that group's schedules.
+
+A background dispatcher in the **same bot container** polls once a second, independently of the DSH worker. SQLite in `state/seen.sqlite3` stores schedules and delivery results; they survive the DSH session ending and container restarts. Scheduled jobs send the saved **static text** using NapCat. They do not start DSH, run shell commands, perform future web searches or keep computations alive beyond the existing five-minute DSH deadline. No host crontab, extra container or new port is needed. Confirmed proactive messages are saved in group history.
+
+Times use Asia/Shanghai. One-time jobs require a full ISO date/time; past times are rejected instead of silently moving to tomorrow. Cron accepts five numeric fields (`minute hour day-of-month month weekday`), including `*`, ranges, lists and steps; Sunday is 0 or 7. Standard cron day-of-month/day-of-week OR semantics apply. Seconds, macros and randomized expressions are unsupported. Keep the host clock synchronized (for example, enable `chronyd` on Rocky Linux). Delivery depends on QQ/network availability; it is not a hard real-time guarantee.
+
+After a disconnect, due messages can be delivered up to five minutes late. Older occurrences and group-rate-limited occurrences are skipped; recurring jobs advance to their next future occurrence without a catch-up flood. Removing a trusted group cancels its pending schedules when the dispatcher next checks them. A confirmed QQ rejection marks the job failed; an ambiguous timeout/disconnect/crash marks it unknown. Failed/unknown jobs are paused, including recurring ones, and are never automatically replayed. Inspect `list` and the group before explicitly creating a replacement. A send already in flight cannot be cancelled or recalled.
+
+The list returns up to 50 schedules, prioritizing active jobs and then recent completed/cancelled jobs, with their last result. Keep `state/seen.sqlite3` in backups along with the archives; it now contains message/schedule text as well as deduplication and upload records.
+
 ## Operations and migration
 
 ```sh
@@ -186,7 +211,7 @@ The tests use synthetic messages and a simulated OneBot server. They do not call
 ```sh
 docker build -t qq-dsh-bot:test .
 docker run --rm --entrypoint /opt/bot-venv/bin/python \
-  qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload
+  qq-dsh-bot:test -m unittest -v test_bot test_history test_media test_upload test_messaging
 ```
 
 GitHub Actions builds the standalone image, runs the tests as the unprivileged runtime user, and validates Compose configuration.
