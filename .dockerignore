@@ -18,3 +18,5 @@
 !test_background.py
 !diagnostics.py
 !test_runtime.py
+!memory.py
+!test_memory.py
