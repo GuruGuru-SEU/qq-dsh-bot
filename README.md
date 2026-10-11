@@ -117,6 +117,72 @@ Status reports the bridge uptime, verified NapCat connection, the current group'
 
 A dedicated status worker replies even when the foreground worker is busy or its queue is full. Its own queue accepts up to 20 pending status requests; excess status requests are dropped without falling back to DSH. Replies use the normal quoted-message delivery and archive path. Connection or delivery failures are logged and never retried blindly. Restarting clears pending status requests.
 
+## Group memory
+
+Each group has persistent memory under `state/groups/<group-id>/memory/`, independent
+of foreground workspaces and background runs. `MEMORY.md` holds essential group rules
+and a topic index; `topics/*.md` holds details, including personal preferences in
+`members.md`. A private `journal.jsonl` records changes with before/after values,
+QQ author, source message ID and time. `memory.sqlite3` is the authoritative store:
+entries, audit records and retry results commit together. Markdown and journal views
+are rebuilt on startup and after changes; edit memory through the helper, not these
+generated files. The whole directory is persistent runtime state and is not committed
+to Git. Back it up with the rest of `state/`.
+
+Examples (with an @mention):
+
+- “记住：本群以后不要说‘xxx’。” saves an essential group rule.
+- “记住我喜欢用 C++ 解算法题。” saves a preference for that QQ user in this group.
+- “你记住了本群的哪些规则？” recalls entries.
+- “把我的语言偏好改成 Python。” updates the existing preference.
+- “忘掉我喜欢 C++ 这条。” removes it from active memory. The private audit journal
+  and original chat archive still retain the prior text; this is not a data-erasure command.
+
+Any member can manage their own preferences. Group rules, group facts, and changes to
+someone else's entries require live QQ owner/admin status or an explicit per-group
+`memory_managers` entry in `config/config.json`, for example:
+
+```json
+"memory_managers": {"529987256": [1234567890]}
+```
+
+Use actual authorized QQ user IDs. This setting is optional and reloads without a
+restart. Role lookup failure denies privileged writes; it does not prevent users
+from saving their own preferences. Background runs can recall but cannot change memory.
+The helper takes no destination group or author: both come from the active request.
+
+At each foreground/background execution, including a steered resume, the bridge loads
+the latest main memory and the requester's personal entries into the prompt. This
+occurs when execution starts, so a queued request sees rules saved by earlier requests.
+Topic details are retrieved as needed. Main memory is limited to 4,000 characters,
+topics to 16,000 each (40 topics), entries to 300, and each person's entries to 4,000
+characters including metadata. No entry is silently evicted to make room.
+
+DSH uses these commands from its current workspace:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/memory.py recall --query '偏好'
+/opt/bot-venv/bin/python /opt/bot/memory.py recall --topic projects --offset 0
+/opt/bot-venv/bin/python /opt/bot/memory.py remember --scope personal --text '喜欢 C++' --key language-1
+/opt/bot-venv/bin/python /opt/bot/memory.py remember --scope group --text '本群避免说 xxx' --key rule-1
+/opt/bot-venv/bin/python /opt/bot/memory.py update ENTRY_ID --revision 1 --text '喜欢 Python' --key language-2
+/opt/bot-venv/bin/python /opt/bot/memory.py forget ENTRY_ID --revision 2 --key remove-language
+```
+
+Recall returns IDs/revisions and pagination. Changes are serialized per group, with
+up to eight changes per request. Retry only with the same key and arguments. Update
+and forget require the current revision to avoid overwriting concurrent corrections.
+The agent must save successfully before claiming it remembered something.
+
+This version saves explicit requests and clear lasting preferences/corrections in
+addressed turns. It does not run an automatic extraction model on ordinary chatter.
+Credential-like content is rejected, and the prompt excludes quotations, websites,
+tool output and guesses from memory sources. Semantic interpretation remains the
+agent's responsibility. Memories guide responses; they do not authorize actions,
+override system rules, or guarantee a literal phrase ban. Exact past conversation
+still comes from `history.py`. As with the other scoped helpers, this single-owner
+runtime is not a hostile multi-tenant security boundary.
+
 ## Persistent history and images
 
 ```text

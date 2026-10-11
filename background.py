@@ -317,7 +317,7 @@ class BackgroundService:
             job.text = original
             if instructions:
                 job.text += '\n\nAdditional instructions from the original requester, in order (newer corrections take precedence):\n' + '\n'.join(r[1] for r in instructions)
-            run = asyncio.create_task(self.bridge.runner(job))
+            run = asyncio.create_task(self.bridge.run_agent(job))
             changed = asyncio.create_task(self.steering_event.wait())
             try:
                 if instructions:

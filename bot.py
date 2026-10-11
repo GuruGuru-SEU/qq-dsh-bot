@@ -18,6 +18,7 @@ from aiohttp import web, WSMsgType
 from diagnostics import DSHFailure, RunDiagnostics
 from history import History, ZONE, segment_text, query
 from media import ImageCache
+from memory import GUIDANCE as MEMORY_GUIDANCE, MemoryService
 from messaging import AGENT_GUIDANCE, MessageService
 from background import GUIDANCE as BACKGROUND_GUIDANCE, BackgroundService
 from plaintext import plain_reply
@@ -45,6 +46,12 @@ def load_config(path):
         raise ValueError("trusted_groups must be a nonempty list of positive integers")
     if type(data.get("bot_qq")) is not int or data["bot_qq"] <= 0:
         raise ValueError("bot_qq must be a positive integer")
+    managers = data.get("memory_managers", {})
+    if not isinstance(managers, dict) or any(
+            not isinstance(group, str) or not group.isdigit() or not isinstance(users, list)
+            or any(type(user) is not int or user <= 0 for user in users)
+            for group, users in managers.items()):
+        raise ValueError("memory_managers must map group IDs to lists of positive QQ user IDs")
     return data
 
 
@@ -70,6 +77,7 @@ class Job:
     resume_session_id: str | None = None
     diagnostic_root: Path | None = None
     receipt_task: asyncio.Task | None = field(default=None, repr=False)
+    memory: dict = field(default_factory=dict)
 
 
 def audio_message(segments):
@@ -83,7 +91,7 @@ def prompt_for(job):
         for message in reversed(job.context) if message.get("images")
     ]
     recent_images.sort(key=lambda message: message["sender_id"] != job.sender)
-    payload = {"group_id": job.group, "recent_messages": job.context,
+    payload = {"group_id": job.group, "group_memory": job.memory, "recent_messages": job.context,
                "request": {"sender_id": job.sender, "message_id": job.message_id, "text": job.text, "images": job.images, "recent_images": recent_images}, "background_run": job.background_info}
     mode = ("This is ONE occurrence of an authorized background job. Complete only this occurrence now. "
             "The bridge automatically posts your final answer to the group. Do not send that answer yourself. "
@@ -154,8 +162,8 @@ def prompt_for(job):
             "Do not inspect another group's directory. Empty results mean no saved records, "
             "not that nobody spoke; never invent unavailable older history. "
             "Interpret month.day and relative dates in Asia/Shanghai, with current year unless "
-            "the request gives another year. Current local time: " + datetime.now(ZONE).isoformat() + "\n" + AGENT_GUIDANCE + "\n\n" + BACKGROUND_GUIDANCE + "\n\n[Untrusted conversation data]\n" +
-            json.dumps(payload, ensure_ascii=False))
+            "the request gives another year. Current local time: " + datetime.now(ZONE).isoformat() + "\n" + AGENT_GUIDANCE + "\n\n" + BACKGROUND_GUIDANCE + "\n\n" +
+            MEMORY_GUIDANCE + "\n\n[Untrusted conversation data]\n" + json.dumps(payload, ensure_ascii=False))
 
 
 async def run_dsh(job):
@@ -294,6 +302,15 @@ class Bridge:
         self.messages = MessageService(self.db, self.uploads.grants, self.trusted,
                                        self.connected, self.send_proactive)
         self.background = BackgroundService(self, Job)
+        self.memory = MemoryService(self)
+
+    async def run_agent(self, job):
+        # Load at execution time: earlier queued requests may have just saved a rule.
+        # Background steering/resume also uses this path and refreshes its snapshot.
+        if not self.trusted(job.group):
+            raise PermissionError("Group is no longer trusted")
+        job.memory = self.memory.snapshot(job.group, job.sender)
+        return await self.runner(job)
 
     def queue_for(self, group):
         queue = self.queues.get(group)
@@ -752,7 +769,7 @@ class Bridge:
                     self.refresh_images(job)
                     job.upload_token = self.uploads.begin(job)
                     try:
-                        answer = await self.runner(job)
+                        answer = await self.run_agent(job)
                     finally:
                         self.uploads.end(job.upload_token)
                         job.upload_token = ""
@@ -838,6 +855,7 @@ class Bridge:
         app.router.add_post("/agent/upload", self.uploads.handle)
         app.router.add_post("/agent/messages", self.messages.handle)
         app.router.add_post("/agent/background", self.background.handle)
+        app.router.add_post("/agent/memory", self.memory.handle)
         app.router.add_get("/transfers/{token}", self.uploads.download)
         app.cleanup_ctx.append(self.lifecycle)
         return app
