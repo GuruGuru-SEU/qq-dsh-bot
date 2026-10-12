@@ -223,13 +223,16 @@ async def run_dsh(job):
             await asyncio.gather(*readers, return_exceptions=True)
 
     try:
-        args = ["dsh", "--profile", "headless", "--patch", "/etc/dsh/agent.patch.yml", "--json"]
+        args = ["dsh", "--profile", "headless", "--patch", "/etc/dsh/agent.patch.yml"]
+        # Launcher overlays must precede app arguments: after --json, --patch
+        # is forwarded to the headless app and rejected as an unknown option.
+        if job.skills_patch:
+            args.extend(["--patch", str(job.skills_patch)])
+        args.append("--json")
         if job.resume_session_id:
             if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", job.resume_session_id):
                 raise ValueError("Invalid resume session")
             args.extend(["--session-id", job.resume_session_id])
-        if job.skills_patch:
-            args.extend(["--patch", str(job.skills_patch)])
         process = await asyncio.create_subprocess_exec(
             *args,
             cwd=workspace, env=env, stdin=asyncio.subprocess.PIPE,

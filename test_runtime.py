@@ -124,10 +124,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_passes_exact_session_and_retains_workspace(self):
         self.job.resume_session_id = 'session-checkpoint'
+        self.job.skills_patch = self.root / 'group-skills.patch.yml'
         workspace = self.job.run_root / 'workspace'
         workspace.mkdir(parents=True)
         (workspace / 'progress.txt').write_text('already computed')
         self.executable("assert sys.argv[sys.argv.index('--session-id')+1] == 'session-checkpoint'\n"
+                        "assert len([arg for arg in sys.argv[:sys.argv.index('--json')] if arg == '--patch']) == 2\n"
                         "assert open('progress.txt').read() == 'already computed'\n"
                         "assert os.environ['DSH_HOME'] == os.path.dirname(os.getcwd()) + '/home'\n"
                         "print(json.dumps({'type':'session','sessionId':'session-checkpoint'}))\n"
