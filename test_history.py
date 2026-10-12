@@ -104,6 +104,15 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.history.transcription("voice")["status"], "ready")
         self.assertIn("请改用 C++", query(self.path, message_id="voice")["messages"][0]["text"])
 
+    def test_file_attachments_are_indexed_and_exposed_without_downloading(self):
+        message = self.message("file", "2026-10-01T12:00:00")
+        message["message"] = [{"type": "file", "data": {"file_id": "qq-file-id", "file_name": "report.pdf", "file_size": "1234"}}]
+        self.history.save(message)
+        self.assertEqual(self.history.files("file")[0]["name"], "report.pdf")
+        result = query(self.path, message_id="file")
+        self.assertEqual(result["messages"][0]["files"][0]["status"], "available")
+        self.assertEqual(result["messages"][0]["files"][0]["size"], 1234)
+
 
 class BackfillTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_pages_are_archived_without_triggering_jobs(self):

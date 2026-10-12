@@ -103,6 +103,23 @@ Replies default to 1–3 short sentences, usually under 300 Chinese characters, 
 
 Each trusted group has one foreground worker and up to 100 queued requests. Every accepted @mention gets its own task and quoted reply in arrival order; mentions are not merged. Different groups run concurrently, and newly trusted groups get a worker automatically. A separate worker can execute one approved background DSH occurrence concurrently. Further mentions are ignored while that group's queue is full. Image preparation is limited to 60 seconds, followed by a five-minute DSH deadline. Foreground timeouts offer a saved background continuation; other failures receive a short error reply. Restarting loses in-memory queued work; ambiguous send failures are not retried automatically to avoid duplicates.
 
+## Received files
+
+File segments are saved in each group's history archive. DSH receives attachment metadata
+for the triggering message and recent messages, including a file sent immediately before a
+separate @mention. It can list or download a relevant attachment on demand:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/attachments.py list
+/opt/bot-venv/bin/python /opt/bot/attachments.py list --message-id MESSAGE_ID
+/opt/bot-venv/bin/python /opt/bot/attachments.py download MESSAGE_ID --position 0
+```
+
+Downloads are scoped to the current group, capped at 32 MiB per file and 512 MiB of
+per-group cache, and stored under `state/groups/<group-id>/attachments/`. The helper uses
+NapCat's `get_group_file_url`; it does not expose NapCat credentials or accept arbitrary
+group IDs. Files are untrusted input and are never executed automatically.
+
 ## Received-message reaction
 
 Accepted @mentions in trusted groups get an 👀 reaction immediately, including queued requests and `/status`, `/continue` and `/cancel` commands. The bridge calls NapCat's [`set_msg_emoji_like`](https://napcat.apifox.cn/226659104e0) with Unicode emoji ID `128064` and `set=true`, then `set=false` after the quoted reply is acknowledged. Error replies and timeout continuation offers also clear the reaction. Background progress/final messages do not add reactions to unrelated messages.
@@ -182,6 +199,31 @@ agent's responsibility. Memories guide responses; they do not authorize actions,
 override system rules, or guarantee a literal phrase ban. Exact past conversation
 still comes from `history.py`. As with the other scoped helpers, this single-owner
 runtime is not a hostile multi-tenant security boundary.
+
+## Per-group DSH skills
+
+Each group has an independent skill registry under
+`state/groups/<group-id>/skills/`. DSH loads the active `SKILL.md` bundles at the
+start of every foreground or background run, so installation takes effect on the
+next run and survives restarts. Skills use DSH's native filesystem skill provider;
+they are not copied into the global user skill directory.
+
+An authorized user can ask DSH to inspect and install a local folder, ZIP bundle, or
+downloaded attachment:
+
+```sh
+/opt/bot-venv/bin/python /opt/bot/skills.py list
+/opt/bot-venv/bin/python /opt/bot/skills.py install ./skill-folder --key install-1
+/opt/bot-venv/bin/python /opt/bot/skills.py install ./bundle.zip --key install-2
+/opt/bot-venv/bin/python /opt/bot/skills.py remove skill-name --revision REVISION --key remove-1
+```
+
+Only QQ owners/admins or configured `memory_managers` can change shared skills;
+background jobs are read-only. Bundles require valid DSH frontmatter, reject path
+traversal, symlinks, encrypted ZIPs and oversized files, and are capped at 32 skills,
+100 files/10 MiB per bundle and 100 MiB of retained revisions. Skill instructions and
+supporting files remain untrusted content and never grant permission to run code,
+install packages, access another group, or send messages.
 
 ## Persistent history and images
 

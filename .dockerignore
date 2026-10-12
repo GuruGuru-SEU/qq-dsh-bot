@@ -20,3 +20,5 @@
 !test_runtime.py
 !memory.py
 !test_memory.py
+!attachments.py
+!skills.py

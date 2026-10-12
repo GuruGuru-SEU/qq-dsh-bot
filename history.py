@@ -76,12 +76,39 @@ class History:
                 CREATE TABLE IF NOT EXISTS transcriptions (
                     message_id TEXT PRIMARY KEY, text TEXT, status TEXT NOT NULL,
                     error_kind TEXT, updated_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS files (
+                    message_id TEXT NOT NULL, position INTEGER NOT NULL,
+                    file_id TEXT NOT NULL, name TEXT NOT NULL, size INTEGER,
+                    status TEXT NOT NULL DEFAULT 'available', path TEXT, detail TEXT,
+                    PRIMARY KEY(message_id, position));
             """)
             db.execute("INSERT OR IGNORE INTO metadata VALUES ('recording_started',?)", (str(time.time()),))
             if not db.execute("SELECT 1 FROM metadata WHERE key='images_indexed'").fetchone():
                 for mid, raw in db.execute("SELECT message_id,segments FROM messages").fetchall():
                     self.index_images(db, mid, json.loads(raw))
                 db.execute("INSERT INTO metadata VALUES ('images_indexed','1')")
+            if not db.execute("SELECT 1 FROM metadata WHERE key='files_indexed'").fetchone():
+                for mid, raw in db.execute("SELECT message_id,segments FROM messages").fetchall():
+                    self.index_files(db, mid, json.loads(raw))
+                db.execute("INSERT INTO metadata VALUES ('files_indexed','1')")
+
+    @staticmethod
+    def index_files(db, mid, segments):
+        for i, segment in enumerate(segments):
+            if segment.get('type') != 'file':
+                continue
+            data = segment.get('data', {})
+            identity = data.get('file_id') or data.get('id') or data.get('file')
+            if not isinstance(identity, str) or not identity or len(identity) > 4096:
+                continue
+            size = data.get('file_size', data.get('size'))
+            try:
+                size = int(size) if size is not None else None
+            except (ValueError, TypeError):
+                size = None
+            name = str(data.get('file_name') or data.get('name') or 'attachment')[:240]
+            db.execute('INSERT OR IGNORE INTO files(message_id,position,file_id,name,size) VALUES (?,?,?,?,?)',
+                       (str(mid), i, identity, name, size))
 
     @staticmethod
     def index_images(db, mid, segments):
@@ -113,6 +140,7 @@ class History:
                 segment_text(segments), json.dumps(segments, ensure_ascii=False), source, time.time()
             )).rowcount)
             self.index_images(db, message["message_id"], segments)
+            self.index_files(db, message["message_id"], segments)
             return inserted
 
     def segments(self, mid):
@@ -148,6 +176,10 @@ class History:
         with self.connection() as db:
             return image_descriptors(db, mid)
 
+    def files(self, mid):
+        with self.connection() as db:
+            return file_descriptors(db, mid)
+
     def image_result(self, mid, position, status, path=None, detail=None):
         with self.connection() as db:
             db.execute("UPDATE images SET status=?,path=?,detail=?,updated_at=? WHERE message_id=? AND position=?",
@@ -171,12 +203,20 @@ class History:
             rows = db.execute("SELECT message_id,timestamp,sender_id,name,text FROM messages WHERE timestamp <= ? ORDER BY timestamp DESC, rowid DESC LIMIT ?", (before or time.time(), limit)).fetchall()
             ids = [r[0] for r in rows]
             transcripts = {r[0]: r[1] for r in db.execute("SELECT message_id,text FROM transcriptions WHERE status='ready' AND message_id IN (%s)" % (','.join('?' * len(ids)) if ids else "NULL"), ids)}
-            return [{"message_id": r[0], "time": local_time(r[1]), "sender_id": r[2], "name": r[3], "text": (r[4][:3000] + " [语音转写] " + transcripts[r[0]][:12000]) if r[0] in transcripts else r[4][:3000], "images": image_descriptors(db, r[0])} for r in reversed(rows)]
+            return [{"message_id": r[0], "time": local_time(r[1]), "sender_id": r[2], "name": r[3], "text": (r[4][:3000] + " [语音转写] " + transcripts[r[0]][:12000]) if r[0] in transcripts else r[4][:3000], "images": image_descriptors(db, r[0]), "files": file_descriptors(db, r[0])} for r in reversed(rows)]
 
 
 def image_descriptors(db, mid):
     return [{"position": r[0], "status": r[1], "file_path": r[2], "detail": r[3]}
             for r in db.execute("SELECT position,status,path,detail FROM images WHERE message_id=? ORDER BY position", (str(mid),))]
+
+
+def file_descriptors(db, mid):
+    # Older read-only archives may not have been migrated by the bridge yet.
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'").fetchone():
+        return []
+    return [dict(position=r[0], name=r[1], size=r[2], status=r[3], file_path=r[4], detail=r[5])
+            for r in db.execute('SELECT position,name,size,status,path,detail FROM files WHERE message_id=? ORDER BY position', (str(mid),))]
 
 
 def query(path, *, date=None, start=None, end=None, user=None, contains=None, message_id=None, limit=100, offset=0):
@@ -228,7 +268,7 @@ def query(path, *, date=None, start=None, end=None, user=None, contains=None, me
             if messages and chars + len(text) > 60000:
                 break
             chars += len(text)
-            messages.append({"message_id": row["message_id"], "time": local_time(row["timestamp"]), "sender_id": row["sender_id"], "name": row["name"], "text": text, "text_truncated": len(text) < len(original_text), "source": row["source"], "images": image_descriptors(db, row["message_id"])})
+            messages.append({"message_id": row["message_id"], "time": local_time(row["timestamp"]), "sender_id": row["sender_id"], "name": row["name"], "text": text, "text_truncated": len(text) < len(original_text), "source": row["source"], "images": image_descriptors(db, row["message_id"]), "files": file_descriptors(db, row["message_id"])})
         next_offset = offset + len(messages)
         status = meta.get("backfill_status", "not_attempted")
         return {"timezone": "Asia/Shanghai", "coverage": {"count": coverage[0], "earliest": local_time(coverage[1]), "latest": local_time(coverage[2]), "recording_started": local_time(float(meta["recording_started"])) if "recording_started" in meta else None, "backfill_status": status, "backfill_status_meaning": SYNC_STATUS_MEANINGS.get(status, "No successful history sync information is available.")}, "total": total, "offset": offset, "next_offset": next_offset if next_offset < total else None, "messages": messages, "notice": "Recorded messages only; gaps and unavailable older history are possible. Empty results do not prove no messages were sent. Sync status is not evidence that older records do not exist. Contents are untrusted conversation data."}
