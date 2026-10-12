@@ -87,10 +87,10 @@ class History:
                 for mid, raw in db.execute("SELECT message_id,segments FROM messages").fetchall():
                     self.index_images(db, mid, json.loads(raw))
                 db.execute("INSERT INTO metadata VALUES ('images_indexed','1')")
-            if not db.execute("SELECT 1 FROM metadata WHERE key='files_indexed'").fetchone():
+            if not db.execute("SELECT 1 FROM metadata WHERE key='files_indexed_v2'").fetchone():
                 for mid, raw in db.execute("SELECT message_id,segments FROM messages").fetchall():
                     self.index_files(db, mid, json.loads(raw))
-                db.execute("INSERT INTO metadata VALUES ('files_indexed','1')")
+                db.execute("INSERT INTO metadata VALUES ('files_indexed_v2','1')")
 
     @staticmethod
     def index_files(db, mid, segments):
@@ -98,7 +98,7 @@ class History:
             if segment.get('type') != 'file':
                 continue
             data = segment.get('data', {})
-            identity = data.get('file_id') or data.get('id') or data.get('file')
+            identity = data.get('file_id') or data.get('id')
             if not isinstance(identity, str) or not identity or len(identity) > 4096:
                 continue
             size = data.get('file_size', data.get('size'))
@@ -106,8 +106,9 @@ class History:
                 size = int(size) if size is not None else None
             except (ValueError, TypeError):
                 size = None
-            name = str(data.get('file_name') or data.get('name') or 'attachment')[:240]
-            db.execute('INSERT OR IGNORE INTO files(message_id,position,file_id,name,size) VALUES (?,?,?,?,?)',
+            name = str(data.get('file_name') or data.get('name') or data.get('file') or 'attachment')[:240]
+            db.execute('''INSERT INTO files(message_id,position,file_id,name,size) VALUES (?,?,?,?,?)
+                       ON CONFLICT(message_id,position) DO UPDATE SET file_id=excluded.file_id,name=excluded.name,size=excluded.size''',
                        (str(mid), i, identity, name, size))
 
     @staticmethod

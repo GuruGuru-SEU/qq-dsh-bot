@@ -105,7 +105,7 @@ Each trusted group has one foreground worker and up to 100 queued requests. Ever
 
 ## Received files
 
-File segments are saved in each group's history archive. DSH receives attachment metadata
+File segments and group-upload notices are saved in each group's history archive. DSH receives attachment metadata
 for the triggering message and recent messages, including a file sent immediately before a
 separate @mention. It can list or download a relevant attachment on demand:
 

@@ -106,7 +106,7 @@ class HistoryTests(unittest.TestCase):
 
     def test_file_attachments_are_indexed_and_exposed_without_downloading(self):
         message = self.message("file", "2026-10-01T12:00:00")
-        message["message"] = [{"type": "file", "data": {"file_id": "qq-file-id", "file_name": "report.pdf", "file_size": "1234"}}]
+        message["message"] = [{"type": "file", "data": {"file_id": "qq-file-id", "file": "report.pdf", "file_size": "1234"}}]
         self.history.save(message)
         self.assertEqual(self.history.files("file")[0]["name"], "report.pdf")
         result = query(self.path, message_id="file")
