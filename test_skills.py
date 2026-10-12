@@ -40,7 +40,9 @@ class SkillTests(unittest.TestCase):
         bundle = load_bundle(self.source)
         first = store.change(self.grant, {'op': 'install', 'path': str(self.source), 'key': 'install'}, bundle)
         self.assertEqual(first['status'], 'installed')
-        self.assertTrue((self.root / 'skills/skill-catalog').exists() is False)
+        patch = store.prepare(self.root / 'run')
+        self.assertEqual(patch.suffix, '.yml')
+        self.assertEqual((self.root / 'run/workspace/.group-skills/explain-code/SKILL.md').read_text(), (self.source / 'SKILL.md').read_text())
         repeated = store.change(self.grant, {'op': 'install', 'path': str(self.source), 'key': 'install'}, bundle)
         self.assertTrue(repeated['reused_result'])
         current = store.listing()[0]['revision']

@@ -258,16 +258,20 @@ class SkillStore:
             temp.replace(alias)
 
     def prepare(self, root):
-        catalog = Path(root) / 'skill-catalog'
+        # Put a private immutable snapshot inside the DSH workspace. The native
+        # filesystem skill provider can then read it under the same sandbox root
+        # as the run, while the registry remains outside and group persistent.
+        workspace = Path(root) / 'workspace'
+        workspace.mkdir(parents=True, exist_ok=True)
+        catalog = workspace / '.group-skills'
+        if catalog.exists():
+            shutil.rmtree(catalog)
         catalog.mkdir(parents=True, exist_ok=True)
-        for child in catalog.iterdir():
-            if child.is_symlink():
-                child.unlink()
         for entry in self.listing():
-            (catalog / entry['name']).symlink_to(entry['path'], target_is_directory=True)
-        patch = Path(root) / 'group-skills.patch.json'
+            shutil.copytree(entry['path'], catalog / entry['name'], symlinks=False)
+        patch = workspace / 'group-skills.patch.yml'
         patch.write_text(json.dumps([{'id': 'skill-filesystem', 'config': {
-            'includeDefaultRoots': False, 'customSkillDirs': [str(catalog)], 'watch': False}}]))
+            'includeDefaultRoots': False, 'customSkillDirs': [str(catalog)], 'watch': False}}], indent=2))
         return patch
 
 
