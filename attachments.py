@@ -25,7 +25,7 @@ Download only a file relevant to the current request, with the bash tool:
 /opt/bot-venv/bin/python /opt/bot/attachments.py download MESSAGE_ID --position N
 /opt/bot-venv/bin/python /opt/bot/attachments.py list --message-id MESSAGE_ID
 For recent attachments, omit --message-id when listing. This accesses only THIS group.
-Use the returned file_path with read/bash/Python (pdftotext for PDFs); inspect the actual
+Use the returned file_path with read/bash/Python; inspect the actual
 content before answering. Never infer contents from names. The file_path is read-only
 input; write outputs in your workspace. Limit 32 MiB per file, 512 MiB cached per group.
 If ambiguous ask which file. Report actual download/format errors, not imaginary permissions.
@@ -156,7 +156,7 @@ def main():
     download = sub.add_parser('download')
     download.add_argument('message_id')
     download.add_argument('--position', type=int, default=0)
-    result = helper_request('attachments', {k: v for k, v in vars(parser.parse_args()).items() if v is not None})
+    result = helper_request('attachments', {k: v for k, v in vars(parser.parse_args()).items() if v is not None}, timeout=90)
     print(json.dumps(result, ensure_ascii=False))
     raise SystemExit(0 if result.get('status') in {'ok', 'ready'} else 1)
 

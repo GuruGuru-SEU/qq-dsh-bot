@@ -255,7 +255,7 @@ class MessageService:
             await asyncio.sleep(1)
 
 
-def helper_request(endpoint, body):
+def helper_request(endpoint, body, timeout=30):
     try:
         grant = capability()
         if not grant.get("token") or not grant.get("url"):
@@ -266,7 +266,7 @@ def helper_request(endpoint, body):
                     headers={"Authorization": "Bearer " + grant["token"], "Content-Type": "application/json"})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            response = opener.open(request, timeout=30)
+            response = opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             response = exc
         with response:

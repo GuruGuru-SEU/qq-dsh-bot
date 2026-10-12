@@ -406,8 +406,10 @@ class Bridge:
     def refresh_images(self, job):
         archive = self.archive(job.group)
         job.images = archive.images(job.message_id)
+        job.files = archive.files(job.message_id)
         for message in job.context:
             message["images"] = archive.images(message["message_id"])
+            message["files"] = archive.files(message["message_id"])
 
     async def sync_history(self):
         """Backfill up to 30 days, then periodically repair recent disconnection gaps."""
@@ -542,6 +544,20 @@ class Bridge:
         return ws
 
     async def event(self, data):
+        if data.get('post_type') == 'notice' and data.get('notice_type') == 'group_upload':
+            group = int(data.get('group_id', 0))
+            attachment = data.get('file')
+            if (int(data.get('self_id', 0)) == self.config['bot_qq'] and self.trusted(group)
+                    and isinstance(attachment, dict) and isinstance(attachment.get('id'), str)):
+                # Notices have no QQ message ID. A deterministic archive-only ID
+                # makes the file discoverable without ever treating it as an @task.
+                import hashlib
+                identity = 'file:' + hashlib.sha256(attachment['id'].encode()).hexdigest()[:24]
+                self.archive(group).save({
+                    'message_id': identity, 'time': data.get('time', time.time()),
+                    'user_id': data.get('user_id', 0),
+                    'message': [{'type': 'file', 'data': attachment}]}, 'group_upload')
+            return
         if data.get("post_type") != "message" or data.get("message_type") != "group":
             return
         group, sender = int(data["group_id"]), int(data["user_id"])
