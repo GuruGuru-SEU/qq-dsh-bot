@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 ZONE = ZoneInfo("Asia/Shanghai")
 SYNC_STATUS_MEANINGS = {
+    "waiting_history_anchor": "SnowLuma has no history page yet; it may need a live group message to establish a server sequence. The last successful sync checkpoint is preserved.",
     "sync_window_reached": "The last sync reached its configured lookback boundary. It does not establish how much older QQ history is available.",
     "incremental_caught_up": "The latest sync caught up to the previous successful sync, with five minutes of overlap. This says nothing about older history availability.",
     "initial_30_day_limit_reached": "The initial import reached its 30-day lookback limit; older QQ history was not checked.",

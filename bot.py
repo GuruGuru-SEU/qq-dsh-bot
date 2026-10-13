@@ -440,7 +440,10 @@ class Bridge:
                         result = await self.api("get_group_msg_history", params)
                         messages = (result or {}).get("messages", [])
                         if not messages:
-                            status = "available_history_exhausted"
+                            # Fresh SnowLuma stores need a live message to establish
+                            # a server sequence. Do not move the sync checkpoint yet.
+                            status = ("waiting_history_anchor" if self.gateway.backend == "snowluma"
+                                      and cursor is None else "available_history_exhausted")
                             break
                         for msg in messages:
                             if int(msg.get("group_id", group)) == group:

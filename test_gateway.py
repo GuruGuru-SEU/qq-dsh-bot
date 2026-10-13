@@ -48,3 +48,34 @@ class GatewayTests(unittest.TestCase):
             archive.save(new)
             self.assertEqual(archive.message_text('42'), 'old')
             self.assertEqual(archive.message_text('snowluma:42'), 'new')
+
+
+class HistoryBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_snowluma_bootstrap_preserves_checkpoint(self):
+        import asyncio
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from bot import Bridge
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'config.json'
+            config.write_text(json.dumps({'gateway': 'snowluma', 'bot_qq': 123,
+                                          'trusted_groups': [456]}))
+            bridge = Bridge(config, tmp, 'x' * 40)
+            archive = bridge.archive(456)
+            archive.metadata('last_successful_sync', '12345')
+            async def api(action, params):
+                return {'messages': []}
+            async def stop_after_pass(seconds):
+                raise asyncio.CancelledError()
+            bridge.api = api
+            bridge.connected.set()
+            try:
+                with patch('bot.asyncio.sleep', stop_after_pass):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await bridge.sync_history()
+                self.assertEqual(archive.get_metadata('last_successful_sync'), '12345')
+                self.assertEqual(archive.get_metadata('backfill_status'), 'waiting_history_anchor')
+            finally:
+                bridge.db.close()
