@@ -193,6 +193,43 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.archive(123456789).transcription('79')['status'], 'ready')
         self.assertIn('稍后才返回的语音文字', self.bridge.archive(123456789).message_text('79'))
 
+    async def test_snowluma_voice_waits_for_server_and_survives_context_deadline(self):
+        from gateway import Gateway
+        config = json.loads(self.config.read_text())
+        config['gateway'] = 'snowluma'
+        self.config.write_text(json.dumps(config))
+        self.bridge.config = config
+        self.bridge.gateway = Gateway('snowluma')
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def api(action, params, **kwargs):
+            calls.append((action, kwargs['timeout']))
+            started.set()
+            await release.wait()
+            return {'text': '延迟返回的结果'}
+
+        self.bridge.api = api
+        event = self.event(-81)
+        event['message'][0] = {'type': 'record', 'data': {'file': 'voice.amr'}}
+        await self.bridge.event(event)
+        await asyncio.wait_for(started.wait(), 1)
+        task = self.bridge.transcription_tasks[(123456789, 'snowluma:-81')]
+        job = self.bridge.queue.get_nowait()
+        try:
+            with patch('bot.PTT_PREPARE_TIMEOUT', 0.001):
+                await self.bridge.prepare_transcriptions(job)
+            self.assertFalse(task.done())
+            self.assertIs(self.bridge.schedule_transcription(123456789, 'snowluma:-81'), task)
+            self.assertEqual(calls, [('fetch_ptt_text', 30)])
+            self.assertIn('[record]', job.text)
+        finally:
+            release.set()
+            await task
+        await self.bridge.prepare_transcriptions(job)
+        self.assertIn('延迟返回的结果', job.text)
+        self.assertEqual(len(calls), 1)
+
     async def test_voice_failure_is_bounded_and_keeps_audio_placeholder(self):
         async def api(action, params, **kwargs):
             raise RuntimeError('transcription unavailable')

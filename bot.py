@@ -36,6 +36,10 @@ LOG = logging.getLogger("qq-dsh")
 PTT_ATTEMPTS = 3
 PTT_API_TIMEOUT = 10
 PTT_ATTEMPT_TIMEOUT = 12
+# SnowLuma keeps its server-side push waiter alive for 20 seconds. A client
+# timeout does not cancel it; retrying sooner supersedes the same-message waiter.
+SNOWLUMA_PTT_API_TIMEOUT = 30
+SNOWLUMA_PTT_ATTEMPT_TIMEOUT = 35
 PTT_RETRY_DELAYS = (0.0, 1.0, 3.0)
 PTT_PREPARE_TIMEOUT = 45
 
@@ -677,13 +681,15 @@ class Bridge:
     async def transcribe_message(self, group, message_id):
         async with self.transcription_sem:
             last_exc = None
+            api_timeout = SNOWLUMA_PTT_API_TIMEOUT if self.gateway.backend == "snowluma" else PTT_API_TIMEOUT
+            attempt_timeout = SNOWLUMA_PTT_ATTEMPT_TIMEOUT if self.gateway.backend == "snowluma" else PTT_ATTEMPT_TIMEOUT
             for attempt in range(PTT_ATTEMPTS):
                 if PTT_RETRY_DELAYS[attempt]:
                     await asyncio.sleep(PTT_RETRY_DELAYS[attempt])
                 try:
                     result = await asyncio.wait_for(
-                        self.api("fetch_ptt_text", {"message_id": message_id}, timeout=PTT_API_TIMEOUT),
-                        PTT_ATTEMPT_TIMEOUT)
+                        self.api("fetch_ptt_text", {"message_id": message_id}, timeout=api_timeout),
+                        attempt_timeout)
                     text = result.get("text") if isinstance(result, dict) else None
                     if not isinstance(text, str) or not text.strip():
                         raise ValueError("empty_transcription")
@@ -715,7 +721,9 @@ class Bridge:
         tasks = [task for mid in dict.fromkeys(ids)
                  if (task := self.schedule_transcription(job.group, mid)) is not None]
         if tasks:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), PTT_PREPARE_TIMEOUT)
+            # These tasks also serve history ingestion and other foreground jobs.
+            # Stop waiting for context without cancelling a request at the gateway.
+            await asyncio.wait(tasks, timeout=PTT_PREPARE_TIMEOUT)
         # Refresh only those same message IDs so completed voice transcriptions
         # appear without changing the ordering or membership of the context.
         for message in snapshot:
