@@ -231,7 +231,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
 
     async def test_voice_failure_is_bounded_and_keeps_audio_placeholder(self):
+        calls = []
         async def api(action, params, **kwargs):
+            calls.append(action)
             raise RuntimeError('transcription unavailable')
         self.bridge.api = api
         event = self.event(78)
@@ -242,6 +244,17 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.prepare_transcriptions(job)
         self.assertIn('[record]', job.text)
         self.assertEqual(self.bridge.archive(123456789).transcription('78')['status'], 'unavailable')
+        self.assertEqual(calls, ['fetch_ptt_text'] * 3)
+        # Repeated history/context visits must not restart exhausted attempts.
+        for _ in range(3):
+            self.assertIsNone(self.bridge.schedule_transcription(123456789, '78'))
+            await self.bridge.prepare_transcriptions(job)
+        restarted = Bridge(self.config, self.tmp.name, 't' * 40)
+        try:
+            self.assertIsNone(restarted.schedule_transcription(123456789, '78'))
+        finally:
+            restarted.db.close()
+        self.assertEqual(len(calls), 3)
 
     async def test_only_explicit_self_mention_and_recent_events(self):
         event = self.event(1)

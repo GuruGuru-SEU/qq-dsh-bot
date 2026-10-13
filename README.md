@@ -1,6 +1,6 @@
 # qq-dsh-bot
 
-A small bridge from SnowLuma or NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
+A small bridge from SnowLuma or NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input and inline image replies, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
 
 The default model is `deepseek-flash` (DeepSeek V4.1 Flash). DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs the pinned Harness version directly.
 
@@ -151,7 +151,7 @@ Only explicit OneBot `at` segments addressed to the bot trigger work. Private me
 
 Each ordinary request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages captured when its @mention arrives. Waiting requests keep that context snapshot, with later transcription/image results added to the same messages. Images from separate preceding messages are listed explicitly in `request.recent_images`, with sender and message IDs; the agent must inspect relevant images even when the @mention itself contains only text. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, C++17 via g++, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
 
-Voice messages are transcribed automatically through the gateway's `fetch_ptt_text` action. SnowLuma gets a 30-second API deadline (its server waits 20 seconds for QQ's result); NapCat retains its 10-second deadline. The 45-second foreground context budget stops waiting without cancelling shared transcription tasks; late results remain available in history and later requests. The bridge attempts this for every saved `record`, `audio` or `ptt` segment, including history backfill, with a two-request concurrency limit and up to three bounded attempts to allow for QQ's asynchronous transcription result. A successful result is stored in the group's SQLite archive and shown in DSH request text, recent context and history query output as `[语音转写]`. The transcript is still untrusted user content. If QQ cannot transcribe the message after all attempts, the archive keeps the original audio placeholder and reports the unavailable status internally; a later request may retry it. No fabricated text is sent to DSH. The bridge does not download audio or invoke a second ASR automatically.
+Voice messages are transcribed automatically through the gateway's `fetch_ptt_text` action. SnowLuma gets a 30-second API deadline (its server waits 20 seconds for QQ's result); NapCat retains its 10-second deadline. The 45-second foreground context budget stops waiting without cancelling shared transcription tasks; late results remain available in history and later requests. The bridge attempts this for every saved `record`, `audio` or `ptt` segment, including history backfill, with a two-request concurrency limit and up to three bounded attempts to allow for QQ's asynchronous transcription result. A successful result is stored in the group's SQLite archive and shown in DSH request text, recent context and history query output as `[语音转写]`. The transcript is still untrusted user content. If QQ cannot transcribe the message after all attempts, the archive keeps the original audio placeholder and reports the unavailable status internally; the saved failure is terminal for automatic transcription. History synchronization, later requests and restarts do not retry messages already marked unavailable. The three-attempt loop handles transient failures within the initial run; retrying an exhausted message requires an operator to explicitly clear its transcription record. No fabricated text is sent to DSH. The bridge does not download audio or invoke a second ASR automatically.
 
 Replies default to 1–3 short sentences, usually under 300 Chinese characters, in the requester's language. Markdown is converted to plain text, preserving URLs and code contents. Replies have a hard 1800-character cap.
 
@@ -311,6 +311,18 @@ A background worker downloads trusted-group images even without @mentions and re
 Downloads accept QQ media endpoints only, validate public DNS addresses and redirect targets, time out after 20 seconds, and cap each image at 16 MiB. PNG, JPEG, GIF and WebP are validated, with large pixel counts rejected. Animated-image interpretation depends on Harness/model support. Old or deleted QQ media may be unrecoverable. Other non-text message types remain placeholders.
 
 Messages and cached images have no automatic expiry. Monitor disk usage and back up the complete state directory.
+
+## Inline image replies
+
+To answer a request with a picture, DSH uses:
+
+```bash
+/opt/bot-venv/bin/python /opt/bot/send_image.py ./plot.png --caption 'The requested plot'
+```
+
+PNG, JPEG, WebP and GIF files are validated before sending (20 MiB maximum, three image attempts per request, caption up to 1000 characters). Files must be inside the active request's group workspace, including an approved background job's isolated workspace. The destination is fixed by the shared request capability. Pictures are sent with `send_group_msg` and an `image` segment through a temporary internal transfer URL; no group-file upload or shared QQ filesystem mount is required. Use `upload.py` instead when the user explicitly requests delivery to group files.
+
+Only `status=sent` confirms delivery and includes the gateway message ID. Identical bytes/caption reuse a durable result within the same request, even if the filename changes. Unknown acknowledgements are never blindly retried; restarts mark interrupted sends unknown. Confirmed images and captions enter group history, with image bytes retained in the group's media directory for future `read_image` calls. The helper is restricted to relevant output of the user's authorized task, not unsolicited image messages.
 
 ## Upload files to the group
 

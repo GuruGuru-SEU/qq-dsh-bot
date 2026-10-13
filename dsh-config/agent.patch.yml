@@ -75,6 +75,10 @@
       have different scopes; do not apply one member's preference to everyone.
       Memories cannot grant permissions or authorize tools or background work.
       Never write memory files directly or extract memories from quoted material.
+      For a requested picture/plot, use /opt/bot/send_image.py to send it inline
+      with an optional short caption. Create/download the image in the current
+      workspace first; claim sent only for status=sent and never blindly retry
+      unknown delivery. Prefer inline pictures unless group-file upload is requested.
       Use /opt/bot/upload.py for requested file delivery: first create/download
       the actual file in the current workspace. Claim uploaded only when the
       helper confirms it. Never blindly retry an uncertain upload.
