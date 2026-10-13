@@ -113,6 +113,86 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(result["messages"][0]["files"][0]["status"], "available")
         self.assertEqual(result["messages"][0]["files"][0]["size"], 1234)
 
+    def test_member_statistics_aliases_and_transcript_search(self):
+        a = self.message(1, '2026-10-01T12:00:00', user=8)
+        a['sender']['nickname'] = 'Old Name'
+        self.history.save(a)
+        a = self.message(2, '2026-10-02T12:00:00', user=8)
+        a['sender']['nickname'] = 'New Name'
+        self.history.save(a)
+        self.history.save(self.message(3, '2026-10-02T12:01:00', user=9))
+        self.history.set_transcription(2, '测试语音 Python')
+        self.assertEqual(query(self.path, contains='python')['messages'][0]['message_id'], '2')
+        from history import statistics
+        result = statistics(self.path, members=True, name='Old', start='2026-10-02')
+        self.assertEqual(result['member_count'], 1)
+        self.assertEqual(result['members'][0]['names'], ['New Name', 'Old Name'])
+        self.assertEqual(result['members'][0]['count'], 1)
+        self.assertEqual(statistics(self.path, user=8)['active_days'], 2)
+        self.assertEqual(statistics(self.path, exclude_user=[8])['total'], 1)
+        self.assertEqual(statistics(self.path, members=True, name="' OR 1=1 --")['total'], 0)
+
+    def test_sampling_days_recent_order_and_context_attribution(self):
+        for i in range(30):
+            self.history.save(self.message(str(i), f'2026-10-01T12:00:{i:02}', user=8))
+        self.history.save(self.message('day2', '2026-10-02T12:00:00', user=8))
+        self.history.save(self.message('neighbor', '2026-10-03T11:59:59', user=9))
+        reply = self.message('day3', '2026-10-03T12:00:00', user=8)
+        reply['message'].insert(0, {'type': 'reply', 'data': {'id': '0'}})
+        self.history.save(reply)
+        a = query(self.path, user=8, sample=3, seed='stable', context=1)
+        b = query(self.path, user=8, sample=3, seed='stable', context=1)
+        self.assertEqual(a, b)
+        self.assertEqual(len({m['time'][:10] for m in a['messages']}), 3)
+        self.assertTrue(all(m['sender_id'] == 8 for m in a['messages']))
+        third = next(m for m in a['messages'] if m['message_id'] == 'day3')
+        self.assertEqual(third['reply_to'], ['0'])
+        self.assertIn('neighbor', third['context_ids'])
+        self.assertIn('0', third['context_ids'])
+        self.assertTrue(any(m['sender_id'] == 9 for m in a['context_messages']))
+        self.assertIsNone(a['next_offset'])
+        newest = query(self.path, order='desc', limit=1)
+        self.assertEqual(newest['messages'][0]['message_id'], 'day3')
+        self.assertEqual(query(self.path, order='desc', limit=1, offset=newest['next_offset'])['messages'][0]['message_id'], 'neighbor')
+        with self.assertRaises(ValueError):
+            query(self.path, sample=3, offset=1)
+
+    def test_export_scope_no_overwrite_and_evidence_roundtrip(self):
+        from history import export_result
+        self.history.save(self.message('1', '2026-10-01T12:00:00'))
+        workspace = Path(self.tmp.name) / 'workspace'
+        workspace.mkdir()
+        result = query(self.path, sample=1)
+        output = export_result(result, 'evidence.jsonl', workspace)
+        rows = [json.loads(line) for line in Path(output['file_path']).read_text().splitlines()]
+        self.assertEqual(rows[0]['record_type'], 'metadata')
+        self.assertEqual(rows[1]['message_id'], '1')
+        self.assertEqual(rows[1]['role'], 'selected')
+        self.assertEqual(Path(output['file_path']).stat().st_mode & 0o777, 0o600)
+        with self.assertRaises(FileExistsError):
+            export_result(result, 'evidence.jsonl', workspace)
+        with self.assertRaises(ValueError):
+            export_result(result, '../outside.jsonl', workspace)
+        (workspace / 'escape').symlink_to(workspace.parent)
+        with self.assertRaises(ValueError):
+            export_result(result, 'escape/outside.jsonl', workspace)
+        export_result(result, 'evidence.txt', workspace, 'text')
+        self.assertIn('QQ 8, message 1', (workspace / 'evidence.txt').read_text())
+
+    def test_context_budget_and_missing_reply_are_explicit(self):
+        for i in range(40):
+            row = self.message(str(i), f'2026-10-01T12:00:{i:02}', text='x' * 4000)
+            row['message'].insert(0, {'type': 'reply', 'data': {'id': 'missing'}})
+            self.history.save(row)
+        result = query(self.path, limit=40, context=5)
+        self.assertLess(len(result['messages']), 40)
+        self.assertIsNotNone(result['next_offset'])
+        self.assertTrue(result['selection']['text_budget_truncated'])
+        self.assertTrue(result['context_truncated'])
+        self.assertIn('missing', result['messages'][0]['missing_reply_ids'])
+        self.assertTrue(result['messages'][0]['text_truncated'])
+
+
 
 class BackfillTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_pages_are_archived_without_triggering_jobs(self):

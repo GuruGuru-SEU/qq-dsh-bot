@@ -310,6 +310,47 @@ A background worker downloads trusted-group images even without @mentions and re
 
 Downloads accept QQ media endpoints only, validate public DNS addresses and redirect targets, time out after 20 seconds, and cap each image at 16 MiB. PNG, JPEG, GIF and WebP are validated, with large pixel counts rejected. Animated-image interpretation depends on Harness/model support. Old or deleted QQ media may be unrecoverable. Other non-text message types remain placeholders.
 
+### History analysis and exports
+
+These generic tools are available to any installed group skill; the bot has no built-in Distilly dependency.
+All commands use `/opt/bot-venv/bin/python /opt/bot/history.py` inside the current group's workspace:
+
+```sh
+# Recorded members/aliases, not a live membership roster; clarify duplicate nicknames.
+history.py --members --name '昵称' --limit 100 --offset 0
+history.py --stats --user 123456 --start 2026-10-01 --end 2026-10-13
+# Recent-first pages; the default remains oldest-first for compatibility.
+history.py --user 123456 --order desc --limit 100
+# Seeded sample balanced across Shanghai calendar days, with conversation context.
+history.py --user 123456 --start 2026-10-01 --end 2026-10-13 --sample 120 --seed profile-v1 --context 2 --output ./evidence.jsonl
+history.py --message-id snowluma:123 --context 3
+```
+
+Use the full interpreter/helper path above in actual shell commands. `--members` and `--stats` accept the same
+sender/date/search/exclusion filters and bounded pagination. `--name` searches historical aliases and may
+return several QQ IDs. `--stats` reports filtered message count, unique senders, active days, first/last timestamps
+and newest-first daily counts. The separate `coverage` object always describes the whole group archive.
+`--contains` searches message text and ready voice transcripts. Repeat `--exclude-user QQ_ID` to omit senders
+from the selection; surrounding context still includes other speakers when needed.
+
+`--sample N` selects up to 200 messages using seeded daily round-robin: one message per day before second
+messages, with seeded day selection if there are more days than slots. It cannot be combined with `--offset`.
+It is reproducible for an unchanged archive and seed, not an exhaustive report or a frequency estimate.
+`--context 0..5` adds adjacent records each side and recorded reply targets, separately attributed in
+`context_messages` and linked by `context_ids`; context may lie outside query dates/senders. `reply_to`
+retains original IDs even without context. Missing reply records and truncated context are flagged.
+
+Pages retain the 60,000-character combined text budget; ordinary message text is capped at 2000 characters,
+single-ID lookups at 16,000. Follow `next_offset` for ordinary pages and inspect `text_truncated`,
+`selection.text_budget_truncated`, and `context_truncated`. Sampling does not return a continuation cursor.
+
+`--output ./new-file.jsonl` writes exactly this bounded result to a new file in the current workspace,
+without overwriting existing files or allowing paths outside the workspace. `--format text` produces a readable
+alternative. JSONL starts with coverage/selection metadata and group ID, followed by selected/context records
+with QQ IDs, message IDs and timestamps. The CLI reports an export summary instead of the entire dataset.
+Exports are limited to 4 MiB, include archive limitations, and do not download images/audio/files. Analyze
+chunks or collect additional bounded queries when needed; never label a sample a complete group history.
+
 Messages and cached images have no automatic expiry. Monitor disk usage and back up the complete state directory.
 
 ## Inline image replies
