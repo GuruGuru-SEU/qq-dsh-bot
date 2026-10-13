@@ -16,10 +16,11 @@ SYNC_STATUS_MEANINGS = {
     "waiting_history_anchor": "SnowLuma has no history page yet; it may need a live group message to establish a server sequence. The last successful sync checkpoint is preserved.",
     "sync_window_reached": "The last sync reached its configured lookback boundary. It does not establish how much older QQ history is available.",
     "incremental_caught_up": "The latest sync caught up to the previous successful sync, with five minutes of overlap. This says nothing about older history availability.",
+    "initial_lookback_limit_reached": "The initial import reached history_lookback_days; older QQ history was not checked. This is an import boundary, not an archive retention limit.",
     "initial_30_day_limit_reached": "The initial import reached its 30-day lookback limit; older QQ history was not checked.",
     "available_history_exhausted": "The gateway returned an empty history page. This is not proof that older messages never existed.",
     "pagination_stalled": "The gateway repeated a history cursor. Pagination stopped; older history availability remains unknown.",
-    "page_limit": "The sync hit its 100-page limit; older records may remain unimported.",
+    "page_limit": "The sync hit its per-pass page limit; the next pass resumes from its saved cursor. Older records may remain unimported.",
     "gateway_history_unavailable": "The history request failed; older records may remain unimported.",
     "napcat_history_unavailable": "The history request failed; older records may remain unimported.",
     "pagination_unavailable": "The returned page had no usable cursor; older records may remain unimported.",
@@ -272,6 +273,8 @@ def coverage_info(db):
     status = meta.get("backfill_status", "not_attempted")
     return {"count": count, "earliest": local_time(earliest), "latest": local_time(latest),
             "recording_started": local_time(float(meta["recording_started"])) if "recording_started" in meta else None,
+            "history_lookback_days": int(meta["history_lookback_days"]) if "history_lookback_days" in meta else None,
+            "history_sync_account": meta.get("history_sync_account"),
             "backfill_status": status, "backfill_status_meaning": SYNC_STATUS_MEANINGS.get(status, "No successful history sync information is available.")}
 
 

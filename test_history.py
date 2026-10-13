@@ -6,9 +6,9 @@ from pathlib import Path
 import tempfile
 import sqlite3
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from bot import Bridge
+from bot import Bridge, load_config
 from history import History, ZONE, current_archive, query
 from plaintext import plain_reply
 
@@ -195,6 +195,94 @@ class HistoryTests(unittest.TestCase):
 
 
 class BackfillTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def old_message(mid, now, age_days):
+        return {"message_id": mid, "group_id": 456, "time": now - age_days * 86400,
+                "user_id": 8, "message": [{"type": "text", "data": {"text": f"message {mid}"}}]}
+
+    async def test_year_import_ignores_legacy_checkpoint_and_keeps_older_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"bot_qq": 123, "trusted_groups": [456]}))
+            bridge = Bridge(config, tmp, "x" * 40)
+            now = 1800000000
+            archive = bridge.archive(456)
+            archive.save(self.old_message(1, now, 500))
+            archive.metadata("last_successful_sync", now - 60)
+            bridge.api = AsyncMock(side_effect=[
+                {"messages": [self.old_message(2, now, 60)]},
+                {"messages": [self.old_message(3, now, 366)]},
+            ])
+            try:
+                with patch("bot.time.time", return_value=now), patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                    await bridge.sync_group_history(456)
+                self.assertEqual(bridge.api.await_count, 2)
+                self.assertEqual(archive.get_metadata("backfill_status"), "initial_lookback_limit_reached")
+                self.assertEqual(query(archive.path)["total"], 3)
+                self.assertEqual(query(archive.path)["coverage"]["history_lookback_days"], 365)
+                self.assertTrue(bridge.queue.empty())
+            finally:
+                bridge.db.close()
+
+    async def test_page_budget_and_process_restart_resume_saved_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"bot_qq": 123, "trusted_groups": [456]}))
+            now = 1800000000
+            bridge = Bridge(config, tmp, "x" * 40)
+            bridge.api = AsyncMock(return_value={"messages": [self.old_message(10, now, 60)]})
+            try:
+                with patch("bot.time.time", return_value=now), patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                    await bridge.sync_group_history(456, page_limit=1)
+                self.assertEqual(bridge.archive(456).get_metadata("backfill_status"), "page_limit")
+            finally:
+                bridge.db.close()
+            bridge = Bridge(config, tmp, "x" * 40)
+            bridge.api = AsyncMock(side_effect=[ConnectionError("offline"),
+                                                {"messages": [self.old_message(11, now, 366)]}])
+            try:
+                with patch("bot.time.time", return_value=now + 600):
+                    await bridge.sync_group_history(456)
+                    self.assertEqual(bridge.archive(456).get_metadata("backfill_status"), "gateway_history_unavailable")
+                    await bridge.sync_group_history(456)
+                for call in bridge.api.await_args_list:
+                    self.assertEqual(call.args[1]["message_seq"], "10")
+                self.assertEqual(query(bridge.archive(456).path)["total"], 2)
+                self.assertEqual(float(bridge.archive(456).get_metadata("last_successful_sync")), now)
+            finally:
+                bridge.db.close()
+
+    async def test_account_switch_rollback_and_longer_window_preserve_group_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            now = 1800000000
+            # Original account, temporary account, original again, then a wider window.
+            runs = [(123, 30, 1, 31), (789, 365, 2, 366),
+                    (123, 30, 3, 1), (123, 365, 4, 366)]
+            for account, days, mid, age in runs:
+                config.write_text(json.dumps({"bot_qq": account, "trusted_groups": [456],
+                                              "history_lookback_days": days}))
+                bridge = Bridge(config, tmp, "x" * 40)
+                bridge.api = AsyncMock(return_value={"messages": [self.old_message(mid, now, age)]})
+                try:
+                    with patch("bot.time.time", return_value=now):
+                        await bridge.sync_group_history(456)
+                    self.assertEqual(bridge.api.await_count, 1)
+                    expected = "incremental_caught_up" if mid == 3 else "initial_lookback_limit_reached"
+                    self.assertEqual(bridge.archive(456).get_metadata("backfill_status"), expected)
+                    self.assertEqual(query(bridge.archive(456).path)["total"], mid)
+                finally:
+                    bridge.db.close()
+
+    def test_lookback_config_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            for value in (0, -1, 3651, True, "365"):
+                config.write_text(json.dumps({"bot_qq": 123, "trusted_groups": [456],
+                                              "history_lookback_days": value}))
+                with self.assertRaisesRegex(ValueError, "history_lookback_days"):
+                    load_config(config)
+
     async def test_history_pages_are_archived_without_triggering_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

@@ -54,6 +54,9 @@ def load_config(path):
         raise ValueError("trusted_groups must be a nonempty list of positive integers")
     if type(data.get("bot_qq")) is not int or data["bot_qq"] <= 0:
         raise ValueError("bot_qq must be a positive integer")
+    days = data.get("history_lookback_days", 365)
+    if type(days) is not int or not 1 <= days <= 3650:
+        raise ValueError("history_lookback_days must be an integer between 1 and 3650")
     managers = data.get("memory_managers", {})
     if not isinstance(managers, dict) or any(
             not isinstance(group, str) or not group.isdigit() or not isinstance(users, list)
@@ -433,60 +436,82 @@ class Bridge:
             message["images"] = archive.images(message["message_id"])
             message["files"] = archive.files(message["message_id"])
 
+    async def sync_group_history(self, group, page_limit=100):
+        """Resume bounded history imports without tying the group archive to an account."""
+        archive = self.archive(group)
+        days = self.config.get("history_lookback_days", 365)
+        # Never reuse another account's (or an older lookback's) completion marker.
+        # Messages remain in the same per-group database across all these changes.
+        key = f"history_sync:{self.gateway.backend}:{self.config['bot_qq']}:{days}"
+        state = json.loads(archive.get_metadata(key) or "{}")
+        started = time.time()
+        last_sync = state.get("last_successful_sync")
+        pending = state.get("pending") or {
+            "started": started,
+            "cutoff": max(started - days * 86400, float(last_sync) - 300)
+                      if last_sync else started - days * 86400,
+            "cursor": None,
+        }
+        state["pending"] = pending
+        archive.metadata(key, json.dumps(state))
+        archive.metadata("history_lookback_days", days)
+        archive.metadata("history_sync_account", self.config["bot_qq"])
+        cursor, added, status = pending["cursor"], 0, "page_limit"
+        cursors = {cursor} if cursor else set()
+        try:
+            for _ in range(page_limit):
+                if not self.trusted(group):
+                    return
+                result = await self.api("get_group_msg_history", self.gateway.history_params(group, cursor))
+                messages = (result or {}).get("messages", [])
+                if not messages:
+                    # An empty bootstrap has no known SnowLuma server sequence yet.
+                    status = ("waiting_history_anchor" if self.gateway.backend == "snowluma"
+                              and cursor is None else "available_history_exhausted")
+                    break
+                for msg in messages:
+                    if int(msg.get("group_id", group)) == group:
+                        added += archive.save(msg, self.gateway.backend + "_history")
+                        segments = msg.get("message")
+                        if isinstance(segments, list) and audio_message(segments):
+                            self.schedule_transcription(group, str(msg.get("message_id")))
+                oldest = min(float(m.get("time", time.time())) for m in messages)
+                if oldest <= pending["cutoff"]:
+                    status = "incremental_caught_up" if last_sync else "initial_lookback_limit_reached"
+                    break
+                first = min(messages, key=lambda message: float(message.get("time", time.time())))
+                if first.get("message_id") is None:
+                    status = "pagination_unavailable"
+                    break
+                cursor = str(first["message_id"])
+                if cursor in cursors or cursor == "0":
+                    status = "pagination_stalled"
+                    break
+                cursors.add(cursor)
+                # Save after every archived page, before yielding, so interruptions
+                # and the per-pass page budget never restart a large import.
+                pending["cursor"] = cursor
+                archive.metadata(key, json.dumps(state))
+                await asyncio.sleep(.25)
+        except (RuntimeError, ConnectionError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+            status = "gateway_history_unavailable"
+        archive.metadata("backfill_status", status)
+        archive.metadata("last_sync", time.time())
+        if status in {"incremental_caught_up", "initial_lookback_limit_reached", "available_history_exhausted"}:
+            # Use the start of the entire walk, including resumed passes, so the
+            # next incremental pass repairs gaps that occurred during the import.
+            state = {"last_successful_sync": pending["started"]}
+            archive.metadata(key, json.dumps(state))
+            archive.metadata("last_successful_sync", pending["started"])
+        LOG.info("history_sync group=%s account=%s lookback_days=%s added=%s status=%s",
+                 group, self.config["bot_qq"], days, added, status)
+
     async def sync_history(self):
-        """Backfill up to 30 days, then periodically repair recent disconnection gaps."""
+        """Import available history up to the configured age, then repair recent gaps."""
         while self.connected.is_set():
             for group in list(self.config["trusted_groups"]):
-                if not self.trusted(group):
-                    continue
-                archive = self.archive(group)
-                started = time.time()
-                last_sync = archive.get_metadata("last_successful_sync")
-                cutoff = max(started - 30 * 86400, float(last_sync) - 300) if last_sync else started - 30 * 86400
-                cursor, added, status = None, 0, "page_limit"
-                cursors = set()
-                try:
-                    for _ in range(100):
-                        if not self.trusted(group):
-                            break
-                        params = self.gateway.history_params(group, cursor)
-                        result = await self.api("get_group_msg_history", params)
-                        messages = (result or {}).get("messages", [])
-                        if not messages:
-                            # Fresh SnowLuma stores need a live message to establish
-                            # a server sequence. Do not move the sync checkpoint yet.
-                            status = ("waiting_history_anchor" if self.gateway.backend == "snowluma"
-                                      and cursor is None else "available_history_exhausted")
-                            break
-                        for msg in messages:
-                            if int(msg.get("group_id", group)) == group:
-                                added += archive.save(msg, self.gateway.backend + "_history")
-                                segments = msg.get("message")
-                                if isinstance(segments, list) and audio_message(segments):
-                                    self.schedule_transcription(group, str(msg.get("message_id")))
-                        oldest = min(float(m.get("time", time.time())) for m in messages)
-                        if oldest <= cutoff:
-                            status = "incremental_caught_up" if last_sync else "initial_30_day_limit_reached"
-                            break
-                        first = min(messages, key=lambda message: float(message.get("time", time.time())))
-                        if first.get("message_id") is None:
-                            status = "pagination_unavailable"
-                            break
-                        # Both adapters take the oldest returned local ID; Gateway
-                        # selects the backend's cursor parameter and direction.
-                        cursor = str(first["message_id"])
-                        if cursor in cursors or cursor == "0":
-                            status = "pagination_stalled"
-                            break
-                        cursors.add(cursor)
-                        await asyncio.sleep(.25)
-                except (RuntimeError, ConnectionError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
-                    status = "gateway_history_unavailable"
-                archive.metadata("backfill_status", status)
-                archive.metadata("last_sync", time.time())
-                if status in {"incremental_caught_up", "initial_30_day_limit_reached", "available_history_exhausted"}:
-                    archive.metadata("last_successful_sync", started)
-                LOG.info("history_sync group=%s added=%s status=%s", group, added, status)
+                if self.trusted(group):
+                    await self.sync_group_history(group)
             await asyncio.sleep(300)
 
     async def api(self, action, params, timeout=15):

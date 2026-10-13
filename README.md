@@ -39,7 +39,8 @@ Replace the example IDs in `config/config.json` with the bot's QQ account and th
   "gateway": "snowluma",
   "bot_qq": 1234567890,
   "trusted_groups": [123456789, 987654321],
-  "history_sync": true
+  "history_sync": true,
+  "history_lookback_days": 365
 }
 ```
 
@@ -304,7 +305,11 @@ DSH must query the archive for questions about past conversation. From its curre
 
 Dates use Asia/Shanghai. `10.1` uses the current year; ISO dates are unambiguous. Date ranges include both endpoint days. Results include archive coverage, total matches, truncation flags, image paths and `next_offset`. The helper binds to the current group's workspace and opens SQLite read-only. DELETE journaling lets read-only queries work without creating WAL sidecar files; existing WAL archives migrate when opened by the bridge.
 
-On connection, the bridge attempts to import up to 30 days of available NapCat history, capped at 100 pages of 100 messages. Subsequent passes run every five minutes to repair recent gaps. This does not guarantee a complete archive. `incremental_caught_up` describes the sync cutoff; `pagination_stalled` means NapCat repeated a cursor. Neither proves that older messages do not exist. Set `history_sync` to `false` to disable imports while retaining live recording.
+On connection, the bridge attempts to import up to 365 days of available QQ history. Set `history_lookback_days` (1–3650, default 365) to change this import boundary. Each pass fetches at most 100 pages of 100 messages; the saved cursor resumes after a restart or in the next five-minute pass. Once the import finishes, subsequent passes repair recent gaps. Sync checkpoints are separate for each gateway, QQ account, and lookback setting, so switching accounts or extending the window starts a fresh import without deleting existing messages.
+
+Archives remain in `state/groups/<group_id>/history.sqlite3` and are shared across accounts. Switching back to the original bot keeps all imported history, including messages that only the temporary account could fetch. There is no age-based deletion: the lookback setting limits fetching, not retention. Preserve the `state/` volume when redeploying or rolling back; account rollback must change config only.
+
+QQ/SnowLuma may expose less than the requested period, so this does not guarantee a complete archive. `incremental_caught_up` describes the sync cutoff; `pagination_stalled` means the gateway repeated a cursor. Neither proves that older messages do not exist. `history.py` reports the configured lookback and current sync account with archive coverage. Set `history_sync` to `false` to disable imports while retaining live recording.
 
 A background worker downloads trusted-group images even without @mentions and resumes pending work after restart. Images are saved by content hash within each group. Missing/expired URLs are refreshed with NapCat `get_msg`, with group and message identity checks. Triggering messages, recent context, quoted messages outside recent context, and history results expose saved paths to DSH's native `read_image` tool. Unavailable images are marked explicitly, never described from a placeholder. Failed downloads retry hourly and can retry sooner for an active request.
 
