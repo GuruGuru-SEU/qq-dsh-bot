@@ -436,14 +436,24 @@ class Bridge:
             message["images"] = archive.images(message["message_id"])
             message["files"] = archive.files(message["message_id"])
 
-    async def sync_group_history(self, group, page_limit=100):
+    async def sync_group_history(self, group, page_limit=100, *, _recent=False):
         """Resume bounded history imports without tying the group archive to an account."""
         archive = self.archive(group)
         days = self.config.get("history_lookback_days", 365)
         # Never reuse another account's (or an older lookback's) completion marker.
         # Messages remain in the same per-group database across all these changes.
         key = f"history_sync:{self.gateway.backend}:{self.config['bot_qq']}:{days}"
+        if _recent:
+            key += ":recent"
         state = json.loads(archive.get_metadata(key) or "{}")
+        if not _recent and state.get("pending"):
+            # A slow/stalled older import must not prevent repairing recent gaps.
+            # Give that walk its own cursor so both can resume independently.
+            recent_key = key + ":recent"
+            if not archive.get_metadata(recent_key):
+                archive.metadata(recent_key, json.dumps({
+                    "last_successful_sync": state["pending"]["started"]}))
+            await self.sync_group_history(group, page_limit, _recent=True)
         started = time.time()
         last_sync = state.get("last_successful_sync")
         pending = state.get("pending") or {

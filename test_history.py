@@ -238,17 +238,47 @@ class BackfillTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 bridge.db.close()
             bridge = Bridge(config, tmp, "x" * 40)
-            bridge.api = AsyncMock(side_effect=[ConnectionError("offline"),
-                                                {"messages": [self.old_message(11, now, 366)]}])
+            bridge.api = AsyncMock(side_effect=[
+                {"messages": [self.old_message(12, now, 1)]}, ConnectionError("offline"),
+                {"messages": [self.old_message(12, now, 1)]},
+                {"messages": [self.old_message(11, now, 366)]},
+            ])
             try:
                 with patch("bot.time.time", return_value=now + 600):
                     await bridge.sync_group_history(456)
                     self.assertEqual(bridge.archive(456).get_metadata("backfill_status"), "gateway_history_unavailable")
                     await bridge.sync_group_history(456)
-                for call in bridge.api.await_args_list:
+                calls = bridge.api.await_args_list
+                self.assertEqual(len(calls), 4)
+                for call in calls[::2]:
+                    self.assertNotIn("message_seq", call.args[1])
+                for call in calls[1::2]:
                     self.assertEqual(call.args[1]["message_seq"], "10")
-                self.assertEqual(query(bridge.archive(456).path)["total"], 2)
+                self.assertEqual(query(bridge.archive(456).path)["total"], 3)
                 self.assertEqual(float(bridge.archive(456).get_metadata("last_successful_sync")), now)
+            finally:
+                bridge.db.close()
+
+    async def test_stalled_backfill_still_repairs_recent_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"bot_qq": 123, "trusted_groups": [456]}))
+            bridge = Bridge(config, tmp, "x" * 40)
+            now = 1800000000
+            old = self.old_message(10, now, 60)
+            bridge.api = AsyncMock(side_effect=[{"messages": [old]}, {"messages": [old]}])
+            try:
+                with patch("bot.time.time", return_value=now), patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                    await bridge.sync_group_history(456)
+                self.assertEqual(bridge.archive(456).get_metadata("backfill_status"), "pagination_stalled")
+                missed = self.old_message(11, now + 500, 0)
+                bridge.api = AsyncMock(side_effect=[{"messages": [missed, old]}, {"messages": [old]}])
+                with patch("bot.time.time", return_value=now + 600):
+                    await bridge.sync_group_history(456)
+                self.assertNotIn("message_seq", bridge.api.await_args_list[0].args[1])
+                self.assertEqual(bridge.api.await_args_list[1].args[1]["message_seq"], "10")
+                self.assertEqual(query(bridge.archive(456).path)["total"], 2)
+                self.assertEqual(bridge.archive(456).get_metadata("backfill_status"), "pagination_stalled")
             finally:
                 bridge.db.close()
 
