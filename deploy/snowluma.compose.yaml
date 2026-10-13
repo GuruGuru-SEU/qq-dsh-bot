@@ -1,0 +1,41 @@
+name: snowluma
+services:
+  snowluma:
+    image: ${SNOWLUMA_IMAGE:-motricseven7/snowluma:v1.14.22}
+    container_name: snowluma
+    hostname: snowluma
+    restart: unless-stopped
+    shm_size: 1gb
+    cap_add: [SYS_PTRACE]
+    security_opt: [seccomp=unconfined]
+    ulimits:
+      nofile: {soft: 65536, hard: 1048576}
+      core: {soft: 0, hard: 0}
+    environment:
+      TZ: Asia/Shanghai
+      SNOWLUMA_WEBUI_HOST: 0.0.0.0
+      SNOWLUMA_WEBUI_PORT: 5099
+      SNOWLUMA_HOOK_AUTOLOAD: 1
+      SNOWLUMA_TELEMETRY: 0
+      SNOWLUMA_ACCEPT_EULA: 1
+      SNOWLUMA_ACCEPT_PRIVACY: 1
+      SNOWLUMA_QQ_FLAGS: --disable-gpu --disable-software-rasterizer --disable-gpu-compositing
+    ports:
+      - "${SNOWLUMA_WEBUI_PORT:-5099}:5099"
+      # Remote desktop is available through an SSH tunnel.
+      - "127.0.0.1:${SNOWLUMA_VNC_PORT:-6081}:6081"
+    volumes:
+      - ./data:/app/data:Z
+      - qq-config:/app/.config
+      - qq-local:/app/.local/share
+    networks: [gateway]
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+networks:
+  gateway:
+    external: true
+    name: ${ONEBOT_NETWORK:-napcat_default}
+volumes:
+  qq-config:
+  qq-local:

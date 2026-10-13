@@ -14,9 +14,10 @@ SYNC_STATUS_MEANINGS = {
     "sync_window_reached": "The last sync reached its configured lookback boundary. It does not establish how much older QQ history is available.",
     "incremental_caught_up": "The latest sync caught up to the previous successful sync, with five minutes of overlap. This says nothing about older history availability.",
     "initial_30_day_limit_reached": "The initial import reached its 30-day lookback limit; older QQ history was not checked.",
-    "available_history_exhausted": "NapCat returned an empty history page. This is not proof that older messages never existed.",
-    "pagination_stalled": "NapCat repeated a history cursor. Pagination stopped; older history availability remains unknown.",
+    "available_history_exhausted": "The gateway returned an empty history page. This is not proof that older messages never existed.",
+    "pagination_stalled": "The gateway repeated a history cursor. Pagination stopped; older history availability remains unknown.",
     "page_limit": "The sync hit its 100-page limit; older records may remain unimported.",
+    "gateway_history_unavailable": "The history request failed; older records may remain unimported.",
     "napcat_history_unavailable": "The history request failed; older records may remain unimported.",
     "pagination_unavailable": "The returned page had no usable cursor; older records may remain unimported.",
 }

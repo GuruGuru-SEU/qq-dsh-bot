@@ -1,13 +1,13 @@
 # qq-dsh-bot
 
-A small bridge from NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
+A small bridge from SnowLuma or NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
 
 The default model is `deepseek-flash` (DeepSeek V4.1 Flash). DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs the pinned Harness version directly.
 
 ## Requirements
 
 - A Linux server with Docker Engine and Docker Compose v2. The container has been tested on an x86-64 Rocky Linux host; other architectures have not been verified.
-- A running NapCat container, logged into the QQ account that will act as the bot.
+- A running SnowLuma or NapCat container, logged into the QQ account that will act as the bot. SnowLuma is the example configuration default.
 - An official DeepSeek API key and access to its API from the server.
 - A Docker network shared by NapCat and this bot. The default is `napcat_default`.
 
@@ -30,12 +30,13 @@ Edit `.env`:
 
 - `DEEPSEEK_API_KEY`: your official DeepSeek key.
 - `ONEBOT_TOKEN`: a random token of at least 32 characters. Generate one with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. Use the same token in NapCat.
-- `NAPCAT_NETWORK`: the Docker network your NapCat container already uses.
+- `ONEBOT_NETWORK`: the Docker network shared with the gateway (`napcat_default` remains the compatibility default; `NAPCAT_NETWORK` is accepted as a fallback).
 
 Replace the example IDs in `config/config.json` with the bot's QQ account and the groups allowed to use it:
 
 ```json
 {
+  "gateway": "snowluma",
   "bot_qq": 1234567890,
   "trusted_groups": [123456789, 987654321],
   "history_sync": true
@@ -65,9 +66,9 @@ docker network connect qq-bot YOUR_NAPCAT_CONTAINER
 
 If you use a separate Compose project for NapCat, also declare that network in its Compose configuration so the attachment survives container recreation. SELinux bind-mount labels are included for hosts such as Rocky Linux.
 
-### 3. Configure NapCat
+### 3. Configure the QQ gateway
 
-In NapCat's OneBot configuration, add an enabled **reverse WebSocket client**:
+In the gateway's OneBot configuration, add an enabled **reverse WebSocket client**:
 
 | Setting | Value |
 | --- | --- |
@@ -90,6 +91,59 @@ docker compose exec bot curl -fsS http://127.0.0.1:8080/health
 Health becomes ready after the authenticated NapCat connection succeeds. In a trusted group, @mention the bot and ask a question. Send an image with the mention, or reply to an image while @mentioning the bot, to test vision.
 
 The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after changing `.env`, Compose, or code. The profile is loaded by each fresh DSH invocation. To change the Harness version, edit the Dockerfile's `DSH_VERSION` default or pass `--build-arg DSH_VERSION=...` to `docker compose build` and verify compatibility before deploying.
+
+## SnowLuma deployment and migration
+
+The bridge supports SnowLuma v1.14.22. Set `"gateway": "snowluma"` in
+`config/config.json`; omitting the field preserves legacy NapCat behavior.
+Changing the gateway requires restarting the bot. Both use the same reverse
+WebSocket URL, token and array message format. SnowLuma's role must be `Universal`.
+
+`deploy/snowluma.compose.yaml` is a separate gateway Compose project. Copy it to
+its own deployment directory as `compose.yaml`; attach it to the same
+`ONEBOT_NETWORK` as the bot. The supplied configuration runs the official
+SnowLuma image (not a modified distribution), disables telemetry, and accepts
+its bundled EULA/privacy terms for unattended startup. Review those terms
+before deploying. Pin `SNOWLUMA_IMAGE` to the pulled digest for reproducibility.
+The image needs `SYS_PTRACE`, `seccomp=unconfined` and a 1 GiB shared-memory mount.
+It persists gateway data separately from QQ configuration and local data.
+
+WebUI: port 5099. The password-protected noVNC desktop is bound to localhost
+on port 6081; for QR login use `ssh -L 6081:127.0.0.1:6081 YOUR_SERVER`, then
+open `http://localhost:6081/`. Initial WebUI and desktop passwords are generated
+by the official image. Do not commit credentials or copy NapCat configuration
+files into SnowLuma. Configure a reverse WebSocket client in SnowLuma and log
+in to the bot QQ account. Never run both gateways against this account at once.
+
+History uses SnowLuma's `message_id` cursor with `reverse_order=true` for older
+pages. SnowLuma IDs are stored as `snowluma:<id>` in archives, requests and helper
+arguments; the bridge strips the prefix only when calling SnowLuma. Existing
+NapCat rows remain readable and distinct. Old gateway IDs are never used to
+fetch/transcribe/react through the new gateway. A resumed task referencing an
+old message sends its answer without a quote. Cached images remain readable;
+uncached old images may need to be resent. Backfill can contain the same real
+message under both gateways' IDs; do not interpret these as distinct statements.
+
+### Concorde rollback
+
+Migration branch: `migration/snowluma`. Original source is preserved on
+`rollback/napcat-20261013`. On the server, the pre-migration bot directory was
+archived at `~/services/qq-dsh-bot/backups/pre-snowluma-20261013/bot.tar.gz`.
+The stopped NapCat container retains its volumes and has restart disabled;
+its writable image layer was saved as `napcat:rollback-20261013`. The previous
+bot image is `qq-dsh-bot:rollback-napcat-20261013`.
+
+For a normal rollback, first check `/health` and let active work finish, then run:
+
+```sh
+bash ~/services/qq-dsh-bot/deploy/rollback-napcat.sh
+```
+
+This stops SnowLuma, changes the current bridge to NapCat, and starts the preserved
+NapCat container. It keeps all history/memories/skills created during the trial.
+The preserved original image/source and archive are additional emergency recovery
+points; do not overwrite live `state/` with the old snapshot during a normal rollback.
+A restored NapCat session may still require QR login at port 6099.
 
 ## Behavior
 

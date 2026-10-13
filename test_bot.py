@@ -258,6 +258,58 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await app_runner.cleanup()
 
+    async def test_snowluma_websocket_ids_replies_and_archive(self):
+        from gateway import Gateway
+        config = json.loads(self.config.read_text())
+        config["gateway"] = "snowluma"
+        self.config.write_text(json.dumps(config))
+        self.bridge.config = config
+        self.bridge.gateway = Gateway("snowluma")
+        app_runner = web.AppRunner(self.bridge.app())
+        await app_runner.setup()
+        site = web.TCPSite(app_runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        url = f"http://127.0.0.1:{port}"
+        try:
+            async with ClientSession() as client:
+                with self.assertRaises(WSServerHandshakeError):
+                    await client.ws_connect(url + "/onebot")
+                headers = {"Authorization": "Bearer " + "t" * 40, "X-Self-ID": "12345"}
+                async with client.ws_connect(url + "/onebot", headers=headers) as ws:
+                    action = await ws.receive_json(timeout=3)
+                    self.assertEqual(action["action"], "get_login_info")
+                    await ws.send_json({"status": "ok", "retcode": 0, "echo": action["echo"], "data": {"user_id": 12345}})
+                    await asyncio.wait_for(self.bridge.connected.wait(), 3)
+                    await ws.send_json(self.event(10, mention=False))
+                    await ws.send_json(self.event(11))
+                    reply = await self.receive_non_reaction(ws)
+                    self.assertEqual(self.reactions, [{'message_id': 11, 'emoji_id': '128064', 'set': True}])
+                    self.assertEqual(reply["action"], "send_group_msg")
+                    self.assertEqual(reply["params"]["group_id"], 123456789)
+                    self.assertEqual(reply["params"]["message"][0], {"type": "reply", "data": {"id": "11"}})
+                    self.assertEqual(reply["params"]["message"][1]["data"]["text"], "VERIFIED_REPLY")
+                    await ws.send_json({"status": "ok", "retcode": 0, "echo": reply["echo"], "data": {"message_id": 12}})
+                    unset = await ws.receive_json(timeout=3)
+                    self.assertEqual(unset["params"]["message_id"], 11)
+                    self.assertFalse(unset["params"]["set"])
+                    await ws.send_json({"status": "ok", "retcode": 0, "echo": unset["echo"], "data": {}})
+                    await asyncio.wait_for(self.bridge.queue.join(), 3)
+                    self.assertEqual(self.jobs[0].message_id, "snowluma:11")
+                    self.assertEqual(self.jobs[0].context[0]["message_id"], "snowluma:10")
+                    self.assertIn("VERIFIED_REPLY", self.bridge.archive(123456789).message_text("snowluma:12"))
+                    self.assertEqual(len(self.jobs), 1)
+                    self.assertEqual(len(self.jobs[0].context), 1)
+                    health = await client.get(url + "/health")
+                    self.assertEqual(health.status, 200)
+            for _ in range(20):
+                if not self.bridge.connected.is_set():
+                    break
+                await asyncio.sleep(.01)
+            self.assertFalse(self.bridge.connected.is_set())
+        finally:
+            await app_runner.cleanup()
+
     async def test_removed_group_is_not_replied_to(self):
         await self.bridge.event(self.event(1))
         job = self.bridge.queue.get_nowait()

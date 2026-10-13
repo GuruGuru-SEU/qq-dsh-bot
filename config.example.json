@@ -1,4 +1,5 @@
 {
+  "gateway": "snowluma",
   "bot_qq": 1234567890,
   "trusted_groups": [123456789],
   "history_sync": true,
