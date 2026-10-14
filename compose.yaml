@@ -44,4 +44,4 @@ services:
 networks:
   napcat:
     external: true
-    name: ${NAPCAT_NETWORK:-napcat_default}
+    name: ${ONEBOT_NETWORK:-${NAPCAT_NETWORK:-napcat_default}}

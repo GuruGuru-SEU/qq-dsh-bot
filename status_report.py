@@ -75,7 +75,7 @@ def status_report(bridge, group):
     return '\n'.join([
         '系统状态（' + datetime.now(ZONE).strftime('%Y-%m-%d %H:%M:%S') + ' 上海时间）',
         '桥接已运行：' + elapsed(now - bridge.started_at),
-        'NapCat：' + ('已连接并验证' if connected else '未就绪'),
+        ('SnowLuma：' if bridge.config.get('gateway') == 'snowluma' else 'NapCat：') + ('已连接并验证' if connected else '未就绪'),
         f"本群前台：{foreground}；排队 {queue.qsize()}/{queue.maxsize}",
         '后台执行器：' + ('忙碌' if bridge.background.current_id else '空闲') + '；单次上限 12小时',
         f"本群后台任务：待确认 {background.get('awaiting_confirmation', 0)}，待运行 {background.get('active', 0)}，运行中 {background.get('running', 0)}",

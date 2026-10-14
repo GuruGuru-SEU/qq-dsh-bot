@@ -114,6 +114,13 @@ class UploadService:
             if deadline < time.monotonic():
                 del self.transfers[token]
 
+    def transfer(self, data):
+        self.prune()
+        token = secrets.token_urlsafe(32)
+        self.transfers[token] = (time.monotonic() + UPLOAD_TIMEOUT + 60, data)
+        asyncio.get_running_loop().call_later(UPLOAD_TIMEOUT + 60, self.transfers.pop, token, None)
+        return token, self.transfer_base + "/transfers/" + token
+
     async def download(self, request):
         self.prune()
         item = self.transfers.get(request.match_info["token"])
@@ -151,13 +158,10 @@ class UploadService:
             if count >= MAX_FILES:
                 return web.json_response({"status": "denied", "message": "At most three file upload attempts are allowed per request"}, status=429)
             self.result(key, {"status": "uploading", "name": name})
-            self.prune()
-            transfer = secrets.token_urlsafe(32)
-            self.transfers[transfer] = (time.monotonic() + UPLOAD_TIMEOUT + 60, data)
-            asyncio.get_running_loop().call_later(UPLOAD_TIMEOUT + 60, self.transfers.pop, transfer, None)
+            transfer, url = self.transfer(data)
             try:
                 response = await self.api("upload_group_file", {
-                    "group_id": str(grant.group), "file": self.transfer_base + "/transfers/" + transfer,
+                    "group_id": str(grant.group), "file": url,
                     "name": name,
                 }, timeout=UPLOAD_TIMEOUT)
                 file_id = response.get("file_id") if isinstance(response, dict) else None

@@ -1,13 +1,13 @@
 # qq-dsh-bot
 
-A small bridge from NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
+A small bridge from SnowLuma or NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input and inline image replies, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
 
 The default model is `deepseek-flash` (DeepSeek V4.1 Flash). DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs the pinned Harness version directly.
 
 ## Requirements
 
 - A Linux server with Docker Engine and Docker Compose v2. The container has been tested on an x86-64 Rocky Linux host; other architectures have not been verified.
-- A running NapCat container, logged into the QQ account that will act as the bot.
+- A running SnowLuma or NapCat container, logged into the QQ account that will act as the bot. SnowLuma is the example configuration default.
 - An official DeepSeek API key and access to its API from the server.
 - A Docker network shared by NapCat and this bot. The default is `napcat_default`.
 
@@ -30,15 +30,17 @@ Edit `.env`:
 
 - `DEEPSEEK_API_KEY`: your official DeepSeek key.
 - `ONEBOT_TOKEN`: a random token of at least 32 characters. Generate one with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. Use the same token in NapCat.
-- `NAPCAT_NETWORK`: the Docker network your NapCat container already uses.
+- `ONEBOT_NETWORK`: the Docker network shared with the gateway (`napcat_default` remains the compatibility default; `NAPCAT_NETWORK` is accepted as a fallback).
 
 Replace the example IDs in `config/config.json` with the bot's QQ account and the groups allowed to use it:
 
 ```json
 {
+  "gateway": "snowluma",
   "bot_qq": 1234567890,
   "trusted_groups": [123456789, 987654321],
-  "history_sync": true
+  "history_sync": true,
+  "history_lookback_days": 365
 }
 ```
 
@@ -65,9 +67,9 @@ docker network connect qq-bot YOUR_NAPCAT_CONTAINER
 
 If you use a separate Compose project for NapCat, also declare that network in its Compose configuration so the attachment survives container recreation. SELinux bind-mount labels are included for hosts such as Rocky Linux.
 
-### 3. Configure NapCat
+### 3. Configure the QQ gateway
 
-In NapCat's OneBot configuration, add an enabled **reverse WebSocket client**:
+In the gateway's OneBot configuration, add an enabled **reverse WebSocket client**:
 
 | Setting | Value |
 | --- | --- |
@@ -91,13 +93,66 @@ Health becomes ready after the authenticated NapCat connection succeeds. In a tr
 
 The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after changing `.env`, Compose, or code. The profile is loaded by each fresh DSH invocation. To change the Harness version, edit the Dockerfile's `DSH_VERSION` default or pass `--build-arg DSH_VERSION=...` to `docker compose build` and verify compatibility before deploying.
 
+## SnowLuma deployment and migration
+
+The bridge supports SnowLuma v1.14.22. Set `"gateway": "snowluma"` in
+`config/config.json`; omitting the field preserves legacy NapCat behavior.
+Changing the gateway requires restarting the bot. Both use the same reverse
+WebSocket URL, token and array message format. SnowLuma's role must be `Universal`.
+
+`deploy/snowluma.compose.yaml` is a separate gateway Compose project. Copy it to
+its own deployment directory as `compose.yaml`; attach it to the same
+`ONEBOT_NETWORK` as the bot. The supplied configuration runs the official
+SnowLuma image (not a modified distribution), disables telemetry, and accepts
+its bundled EULA/privacy terms for unattended startup. Review those terms
+before deploying. Pin `SNOWLUMA_IMAGE` to the pulled digest for reproducibility.
+The image needs `SYS_PTRACE`, `seccomp=unconfined` and a 1 GiB shared-memory mount.
+It persists gateway data separately from QQ configuration and local data.
+
+WebUI: port 5099. The password-protected noVNC desktop is bound to localhost
+on port 6081; for QR login use `ssh -L 6081:127.0.0.1:6081 YOUR_SERVER`, then
+open `http://localhost:6081/`. Initial WebUI and desktop passwords are generated
+by the official image. Do not commit credentials or copy NapCat configuration
+files into SnowLuma. Configure a reverse WebSocket client in SnowLuma and log
+in to the bot QQ account. Never run both gateways against this account at once.
+
+History uses SnowLuma's `message_id` cursor with `reverse_order=true` for older
+pages. SnowLuma IDs are stored as `snowluma:<id>` in archives, requests and helper
+arguments; the bridge strips the prefix only when calling SnowLuma. Existing
+NapCat rows remain readable and distinct. Old gateway IDs are never used to
+fetch/transcribe/react through the new gateway. A resumed task referencing an
+old message sends its answer without a quote. Cached images remain readable;
+uncached old images may need to be resent. Backfill can contain the same real
+message under both gateways' IDs; do not interpret these as distinct statements.
+
+### Concorde rollback
+
+Migration branch: `migration/snowluma`. Original source is preserved on
+`rollback/napcat-20261013`. On the server, the pre-migration bot directory was
+archived at `~/services/qq-dsh-bot/backups/pre-snowluma-20261013/bot.tar.gz`.
+The stopped NapCat container retains its volumes and has restart disabled;
+its writable image layer was saved as `napcat:rollback-20261013`. The previous
+bot image is `qq-dsh-bot:rollback-napcat-20261013`.
+
+For a normal rollback, first check `/health` and let active work finish, then run:
+
+```sh
+bash ~/services/qq-dsh-bot/deploy/rollback-napcat.sh
+```
+
+This stops SnowLuma, changes the current bridge to NapCat, and starts the preserved
+NapCat container. It keeps all history/memories/skills created during the trial.
+The preserved original image/source and archive are additional emergency recovery
+points; do not overwrite live `state/` with the old snapshot during a normal rollback.
+A restored NapCat session may still require QR login at port 6099.
+
 ## Behavior
 
 Only explicit OneBot `at` segments addressed to the bot trigger work. Private messages, untrusted groups, @all, text resembling an @mention, and the bot's own messages do not trigger tasks. Live messages more than five minutes old are archived without triggering. Trigger deduplication persists for seven days.
 
 Each ordinary request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages captured when its @mention arrives. Waiting requests keep that context snapshot, with later transcription/image results added to the same messages. Images from separate preceding messages are listed explicitly in `request.recent_images`, with sender and message IDs; the agent must inspect relevant images even when the @mention itself contains only text. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, C++17 via g++, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
 
-Voice messages are transcribed automatically through NapCat's `fetch_ptt_text` action. The bridge attempts this for every saved `record`, `audio` or `ptt` segment, including history backfill, with a two-request concurrency limit and up to three bounded attempts to allow for QQ's asynchronous transcription result. A successful result is stored in the group's SQLite archive and shown in DSH request text, recent context and history query output as `[语音转写]`. The transcript is still untrusted user content. If QQ cannot transcribe the message after all attempts, the archive keeps the original audio placeholder and reports the unavailable status internally; a later request may retry it. No fabricated text is sent to DSH. The bridge does not download audio or invoke a second ASR automatically.
+Voice messages are transcribed automatically through the gateway's `fetch_ptt_text` action. SnowLuma gets a 30-second API deadline (its server waits 20 seconds for QQ's result); NapCat retains its 10-second deadline. The 45-second foreground context budget stops waiting without cancelling shared transcription tasks; late results remain available in history and later requests. The bridge attempts this for every saved `record`, `audio` or `ptt` segment, including history backfill, with a two-request concurrency limit and up to three bounded attempts to allow for QQ's asynchronous transcription result. A successful result is stored in the group's SQLite archive and shown in DSH request text, recent context and history query output as `[语音转写]`. The transcript is still untrusted user content. If QQ cannot transcribe the message after all attempts, the archive keeps the original audio placeholder and reports the unavailable status internally; the saved failure is terminal for automatic transcription. History synchronization, later requests and restarts do not retry messages already marked unavailable. The three-attempt loop handles transient failures within the initial run; retrying an exhausted message requires an operator to explicitly clear its transcription record. No fabricated text is sent to DSH. The bridge does not download audio or invoke a second ASR automatically.
 
 Replies default to 1–3 short sentences, usually under 300 Chinese characters, in the requester's language. Markdown is converted to plain text, preserving URLs and code contents. Replies have a hard 1800-character cap.
 
@@ -250,13 +305,70 @@ DSH must query the archive for questions about past conversation. From its curre
 
 Dates use Asia/Shanghai. `10.1` uses the current year; ISO dates are unambiguous. Date ranges include both endpoint days. Results include archive coverage, total matches, truncation flags, image paths and `next_offset`. The helper binds to the current group's workspace and opens SQLite read-only. DELETE journaling lets read-only queries work without creating WAL sidecar files; existing WAL archives migrate when opened by the bridge.
 
-On connection, the bridge attempts to import up to 30 days of available NapCat history, capped at 100 pages of 100 messages. Subsequent passes run every five minutes to repair recent gaps. This does not guarantee a complete archive. `incremental_caught_up` describes the sync cutoff; `pagination_stalled` means NapCat repeated a cursor. Neither proves that older messages do not exist. Set `history_sync` to `false` to disable imports while retaining live recording.
+On connection, the bridge attempts to import up to 365 days of available QQ history. Set `history_lookback_days` (1–3650, default 365) to change this import boundary. Each pass fetches at most 100 pages of 100 messages; the saved cursor resumes after a restart or in the next five-minute pass. Recent gaps are repaired on a separate checkpoint while an older import is pending or stalled, and after it finishes. Sync checkpoints are separate for each gateway, QQ account, and lookback setting, so switching accounts or extending the window starts a fresh import without deleting existing messages.
+
+Archives remain in `state/groups/<group_id>/history.sqlite3` and are shared across accounts. Switching back to the original bot keeps all imported history, including messages that only the temporary account could fetch. There is no age-based deletion: the lookback setting limits fetching, not retention. Preserve the `state/` volume when redeploying or rolling back; account rollback must change config only.
+
+QQ/SnowLuma may expose less than the requested period, so this does not guarantee a complete archive. `incremental_caught_up` describes the sync cutoff; `pagination_stalled` means the gateway repeated a cursor. Neither proves that older messages do not exist. `history.py` reports the configured lookback and current sync account with archive coverage. Set `history_sync` to `false` to disable imports while retaining live recording.
 
 A background worker downloads trusted-group images even without @mentions and resumes pending work after restart. Images are saved by content hash within each group. Missing/expired URLs are refreshed with NapCat `get_msg`, with group and message identity checks. Triggering messages, recent context, quoted messages outside recent context, and history results expose saved paths to DSH's native `read_image` tool. Unavailable images are marked explicitly, never described from a placeholder. Failed downloads retry hourly and can retry sooner for an active request.
 
 Downloads accept QQ media endpoints only, validate public DNS addresses and redirect targets, time out after 20 seconds, and cap each image at 16 MiB. PNG, JPEG, GIF and WebP are validated, with large pixel counts rejected. Animated-image interpretation depends on Harness/model support. Old or deleted QQ media may be unrecoverable. Other non-text message types remain placeholders.
 
+### History analysis and exports
+
+These generic tools are available to any installed group skill; the bot has no built-in Distilly dependency.
+All commands use `/opt/bot-venv/bin/python /opt/bot/history.py` inside the current group's workspace:
+
+```sh
+# Recorded members/aliases, not a live membership roster; clarify duplicate nicknames.
+history.py --members --name '昵称' --limit 100 --offset 0
+history.py --stats --user 123456 --start 2026-10-01 --end 2026-10-13
+# Recent-first pages; the default remains oldest-first for compatibility.
+history.py --user 123456 --order desc --limit 100
+# Seeded sample balanced across Shanghai calendar days, with conversation context.
+history.py --user 123456 --start 2026-10-01 --end 2026-10-13 --sample 120 --seed profile-v1 --context 2 --output ./evidence.jsonl
+history.py --message-id snowluma:123 --context 3
+```
+
+Use the full interpreter/helper path above in actual shell commands. `--members` and `--stats` accept the same
+sender/date/search/exclusion filters and bounded pagination. `--name` searches historical aliases and may
+return several QQ IDs. `--stats` reports filtered message count, unique senders, active days, first/last timestamps
+and newest-first daily counts. The separate `coverage` object always describes the whole group archive.
+`--contains` searches message text and ready voice transcripts. Repeat `--exclude-user QQ_ID` to omit senders
+from the selection; surrounding context still includes other speakers when needed.
+
+`--sample N` selects up to 200 messages using seeded daily round-robin: one message per day before second
+messages, with seeded day selection if there are more days than slots. It cannot be combined with `--offset`.
+It is reproducible for an unchanged archive and seed, not an exhaustive report or a frequency estimate.
+`--context 0..5` adds adjacent records each side and recorded reply targets, separately attributed in
+`context_messages` and linked by `context_ids`; context may lie outside query dates/senders. `reply_to`
+retains original IDs even without context. Missing reply records and truncated context are flagged.
+
+Pages retain the 60,000-character combined text budget; ordinary message text is capped at 2000 characters,
+single-ID lookups at 16,000. Follow `next_offset` for ordinary pages and inspect `text_truncated`,
+`selection.text_budget_truncated`, and `context_truncated`. Sampling does not return a continuation cursor.
+
+`--output ./new-file.jsonl` writes exactly this bounded result to a new file in the current workspace,
+without overwriting existing files or allowing paths outside the workspace. `--format text` produces a readable
+alternative. JSONL starts with coverage/selection metadata and group ID, followed by selected/context records
+with QQ IDs, message IDs and timestamps. The CLI reports an export summary instead of the entire dataset.
+Exports are limited to 4 MiB, include archive limitations, and do not download images/audio/files. Analyze
+chunks or collect additional bounded queries when needed; never label a sample a complete group history.
+
 Messages and cached images have no automatic expiry. Monitor disk usage and back up the complete state directory.
+
+## Inline image replies
+
+To answer a request with a picture, DSH uses:
+
+```bash
+/opt/bot-venv/bin/python /opt/bot/send_image.py ./plot.png --caption 'The requested plot'
+```
+
+PNG, JPEG, WebP and GIF files are validated before sending (20 MiB maximum, three image attempts per request, caption up to 1000 characters). Files must be inside the active request's group workspace, including an approved background job's isolated workspace. The destination is fixed by the shared request capability. Pictures are sent with `send_group_msg` and an `image` segment through a temporary internal transfer URL; no group-file upload or shared QQ filesystem mount is required. Use `upload.py` instead when the user explicitly requests delivery to group files.
+
+Only `status=sent` confirms delivery and includes the gateway message ID. Identical bytes/caption reuse a durable result within the same request, even if the filename changes. Unknown acknowledgements are never blindly retried; restarts mark interrupted sends unknown. Confirmed images and captions enter group history, with image bytes retained in the group's media directory for future `read_image` calls. The helper is restricted to relevant output of the user's authorized task, not unsolicited image messages.
 
 ## Upload files to the group
 
