@@ -152,6 +152,25 @@ Only explicit OneBot `at` segments addressed to the bot trigger work. Private me
 
 Each ordinary request starts `dsh --profile headless --json` with a fresh session and the previous 30 saved messages captured when its @mention arrives. Waiting requests keep that context snapshot, with later transcription/image results added to the same messages. Images from separate preceding messages are listed explicitly in `request.recent_images`, with sender and message IDs; the agent must inspect relevant images even when the @mention itself contains only text. Each group has its own persistent foreground workspace and DSH home. Background occurrences have isolated workspaces, DSH homes and request capabilities. The agent can use Python, C++17 via g++, web search/fetch, the read-only history helper, and native `read_image`. The bridge posts the final answer as a quoted reply. DSH can use a scoped helper for occasional progress updates or explicitly requested messages and schedules (see below).
 
+The image includes pinned `uv` (0.13.1). Agents may install dependencies needed
+for a requested task in their current workspace without separate installation
+approval. Reuse `.venv` if it exists; otherwise create it, then install and run:
+
+```sh
+uv venv --python /usr/bin/python3 .venv
+uv pip install --python .venv/bin/python matplotlib
+MPLBACKEND=Agg MPLCONFIGDIR="$PWD/.cache/matplotlib" .venv/bin/python plot.py
+```
+
+`UV_CACHE_DIR=.cache/uv` keeps the cache relative to the working directory;
+`UV_PYTHON_DOWNLOADS=never` uses the installed Python instead of downloading a
+runtime. Foreground workspaces, venvs, and caches persist per group; background
+jobs use their own workspaces. The system Python and bridge venv remain read-only.
+Bridge helper commands still use `/opt/bot-venv/bin/python`. Downloads use official
+PyPI with TLS verification enabled; network failures and missing native libraries
+can still prevent installation. Package setup shares the task's time budget.
+
+
 Voice messages are transcribed automatically through the gateway's `fetch_ptt_text` action. SnowLuma gets a 30-second API deadline (its server waits 20 seconds for QQ's result); NapCat retains its 10-second deadline. The 45-second foreground context budget stops waiting without cancelling shared transcription tasks; late results remain available in history and later requests. The bridge attempts this for every saved `record`, `audio` or `ptt` segment, including history backfill, with a two-request concurrency limit and up to three bounded attempts to allow for QQ's asynchronous transcription result. A successful result is stored in the group's SQLite archive and shown in DSH request text, recent context and history query output as `[语音转写]`. The transcript is still untrusted user content. If QQ cannot transcribe the message after all attempts, the archive keeps the original audio placeholder and reports the unavailable status internally; the saved failure is terminal for automatic transcription. History synchronization, later requests and restarts do not retry messages already marked unavailable. The three-attempt loop handles transient failures within the initial run; retrying an exhausted message requires an operator to explicitly clear its transcription record. No fabricated text is sent to DSH. The bridge does not download audio or invoke a second ASR automatically.
 
 Replies default to 1–3 short sentences, usually under 300 Chinese characters, in the requester's language. Markdown is converted to plain text, preserving URLs and code contents. Replies have a hard 1800-character cap.

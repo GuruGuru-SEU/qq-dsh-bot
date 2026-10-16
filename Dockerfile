@@ -11,6 +11,12 @@ RUN python3 -m venv /opt/bot-venv \
     && /opt/bot-venv/bin/pip install --no-cache-dir -r /opt/bot/requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends g++ \
     && rm -rf /var/lib/apt/lists/*
+ARG UV_VERSION=0.13.1
+RUN /opt/bot-venv/bin/python -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+    && ln -s /opt/bot-venv/bin/uv /usr/local/bin/uv \
+    && ln -s /opt/bot-venv/bin/uvx /usr/local/bin/uvx
+# Resolve the cache relative to each agent's workspace; /home/node is read-only.
+ENV UV_CACHE_DIR=.cache/uv UV_PYTHON_DOWNLOADS=never
 COPY send_image.py test_send_image.py gateway.py test_gateway.py memory.py test_memory.py attachments.py skills.py test_skills.py test_attachments.py status_report.py diagnostics.py test_runtime.py background.py test_background.py messaging.py test_messaging.py bot.py history.py plaintext.py media.py upload.py smoke_upload.py test_bot.py test_history.py test_media.py test_upload.py /opt/bot/
 ENV HOME=/home/node TZ=Asia/Shanghai PYTHONUNBUFFERED=1
 USER node
