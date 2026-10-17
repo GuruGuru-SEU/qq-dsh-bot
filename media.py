@@ -28,11 +28,15 @@ def checked_url(value):
     return url
 
 
+class ImageDNSRejected(ValueError):
+    """A proxy fake IP or private address is not safe for media downloads."""
+
+
 class PublicResolver(ThreadedResolver):
     async def resolve(self, host, port=0, family=0):
         addresses = await super().resolve(host, port, family)
         if not addresses or any(not ipaddress.ip_address(a["host"]).is_global for a in addresses):
-            raise ValueError("Image endpoint resolved to a non-public address")
+            raise ImageDNSRejected("Image endpoint resolved to a non-public address")
         return addresses
 
 
@@ -89,11 +93,12 @@ class ImageCache:
                 position = image["position"]
                 data = segments[position].get("data", {})
                 raw = None
+                download_error = None
                 if data.get("url"):
                     try:
                         raw = await download_image(data["url"])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        download_error = type(exc).__name__
                 try:
                     phase = "refresh_message"
                     if raw is None:
@@ -126,6 +131,9 @@ class ImageCache:
                     archive.image_result(mid, position, "ready", path)
                 except Exception as exc:
                     # Never expose signed URLs or exception contents in logs/prompts.
-                    LOG.warning("image_unavailable group=%s message=%s position=%s phase=%s kind=%s http_status=%s",
-                                group, mid, position, phase, type(exc).__name__, getattr(exc, "status", None))
-                    archive.image_result(mid, position, "unavailable", detail="Image could not be downloaded or validated; ask the sender to resend if needed.")
+                    LOG.warning("image_unavailable group=%s message=%s position=%s phase=%s kind=%s initial_download_kind=%s http_status=%s",
+                                group, mid, position, phase, type(exc).__name__, download_error, getattr(exc, "status", None))
+                    detail = "Image could not be downloaded or validated; ask the sender to resend if needed."
+                    if isinstance(exc, ImageDNSRejected) or download_error == "ImageDNSRejected":
+                        detail = "QQ image DNS resolved to a non-public address (possibly proxy fake-IP); the server's DNS configuration needs repair."
+                    archive.image_result(mid, position, "unavailable", detail=detail)

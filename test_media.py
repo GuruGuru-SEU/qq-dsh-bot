@@ -12,7 +12,7 @@ from yarl import URL
 
 from bot import Bridge, prompt_for
 from history import History, query
-from media import ImageCache, checked_url, download_image, image_extension
+from media import ImageCache, ImageDNSRejected, PublicResolver, checked_url, download_image, image_extension
 
 
 def picture():
@@ -65,6 +65,32 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             await cache.cache_message(self.archive, 123456789, "12")
             download.assert_not_awaited()
         self.assertEqual(self.archive.images("12")[0]["status"], "unavailable")
+
+    async def test_dns_failure_is_reported_even_when_message_refresh_fails(self):
+        self.archive.save(message())
+        cache = ImageCache(AsyncMock(side_effect=RuntimeError("secret signed URL")), lambda g: True)
+        with patch("media.download_image", AsyncMock(side_effect=ImageDNSRejected("private IP"))):
+            with self.assertLogs("qq-dsh", level="WARNING") as logs:
+                await cache.cache_message(self.archive, 123456789, "11")
+        self.assertIn("initial_download_kind=ImageDNSRejected", logs.output[0])
+        image = self.archive.images("11")[0]
+        self.assertIn("DNS", image["detail"])
+        self.assertNotIn("secret", image["detail"] + logs.output[0])
+
+    async def test_public_resolver_rejects_fake_ips_and_private_addresses(self):
+        resolver = PublicResolver()
+        try:
+            for addresses in [[], [{"host": "198.18.0.15"}], [{"host": "127.0.0.1"}],
+                              [{"host": "10.0.0.1"}], [{"host": "::1"}],
+                              [{"host": "1.1.1.1"}, {"host": "192.168.1.1"}]]:
+                with patch("media.ThreadedResolver.resolve", AsyncMock(return_value=addresses)):
+                    with self.assertRaises(ImageDNSRejected):
+                        await resolver.resolve("multimedia.nt.qq.com.cn", 443)
+            addresses = [{"host": "1.1.1.1"}, {"host": "2606:4700:4700::1111"}]
+            with patch("media.ThreadedResolver.resolve", AsyncMock(return_value=addresses)):
+                self.assertEqual(await resolver.resolve("multimedia.nt.qq.com.cn", 443), addresses)
+        finally:
+            await resolver.close()
 
     async def test_trigger_and_quoted_old_image_reach_dsh_prompt(self):
         config = self.root / "config.json"

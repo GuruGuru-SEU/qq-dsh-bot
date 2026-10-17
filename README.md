@@ -2,7 +2,7 @@
 
 A small bridge from SnowLuma or NapCat QQ groups to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). An explicit @mention in a trusted group starts a headless DSH session, with recent conversation context, Python and web tools, searchable chat history, image input and inline image replies, group-file uploads, progress updates, persistent message schedules, and approved background DSH jobs. The final answer is posted as a short plain-text reply.
 
-The default model is `deepseek-flash` (DeepSeek V4.1 Flash). DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs the pinned Harness version directly.
+The default model is `deepseek-flash` (DeepSeek V4.1 Flash, currently the 2026-10-17 update). This official API alias follows DeepSeek's Flash updates; the agent's self-description is not version evidence. DSH runs inside the bot container; no separate agent service or Docker socket is needed. The Dockerfile builds from a public Node base and installs Harness `0.2.1-rc.2`, pinned explicitly because npm's `latest` tag can lag prereleases.
 
 ## Requirements
 
@@ -90,6 +90,16 @@ docker compose exec bot curl -fsS http://127.0.0.1:8080/health
 ```
 
 Health becomes ready after the authenticated NapCat connection succeeds. In a trusted group, @mention the bot and ask a question. Send an image with the mention, or reply to an image while @mentioning the bot, to test vision.
+
+If the host uses Mihomo/Clash fake-IP DNS, add `+.qq.com`, `+.qpic.cn`,
+`+.qlogo.cn` and `+.multimedia.nt.qq.com.cn` to its DNS `fake-ip-filter`
+(in the default exclusion/blacklist mode), then reload the proxy configuration.
+These QQ media hosts must resolve to real public addresses inside the bot
+container. The downloader intentionally rejects private and reserved addresses,
+including fake IPs in `198.18.0.0/15`; do not disable this check or TLS verification.
+`ImageDNSRejected` in image-failure logs identifies this configuration problem.
+Previously failed images can be fetched on the next relevant request or the
+hourly cache retry; expired QQ URLs may still require a resend.
 
 The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after changing `.env`, Compose, or code. The profile is loaded by each fresh DSH invocation. To change the Harness version, edit the Dockerfile's `DSH_VERSION` default or pass `--build-arg DSH_VERSION=...` to `docker compose build` and verify compatibility before deploying.
 

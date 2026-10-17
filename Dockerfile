@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-ARG DSH_VERSION=0.2.0-rc.2
+ARG DSH_VERSION=0.2.1-rc.2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-numpy python3-sympy python3-requests \
     git curl ca-certificates ripgrep bash bubblewrap tini \
