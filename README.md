@@ -103,6 +103,12 @@ hourly cache retry; expired QQ URLs may still require a resend.
 
 The agent profile is in `dsh-config/agent.patch.yml`. Restart the bot after changing `.env`, Compose, or code. The profile is loaded by each fresh DSH invocation. To change the Harness version, edit the Dockerfile's `DSH_VERSION` default or pass `--build-arg DSH_VERSION=...` to `docker compose build` and verify compatibility before deploying.
 
+Web search and page retrieval use DeepSeek's dedicated Search and Fetch APIs
+(`deepseek-search-api` and `deepseek-fetch-api`), sharing `DEEPSEEK_API_KEY`.
+They call `https://api.deepseek.com/v1/tools/search` and `/v1/tools/fetch`
+directly, rather than making an auxiliary model request for search or fetching
+pages locally. Retrieval API charges are separate from model token usage.
+
 ## SnowLuma deployment and migration
 
 The bridge supports SnowLuma v1.14.22. Set `"gateway": "snowluma"` in

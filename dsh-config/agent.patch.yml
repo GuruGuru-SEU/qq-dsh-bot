@@ -3,12 +3,13 @@
     provider: deepseek-official
     model: deepseek-flash
     reasoningEffort: high
-- id: web-search-deepseek
+- id: web
+  config:
+    searchProvider: deepseek-search-api
+    fetchProvider: deepseek-fetch-api
+- id: web-deepseek-api
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
-    model: deepseek-flash
-    maxTokens: 4096
-    maxUses: 3
 - id: session-log-deepseek
   config:
     enabled: false
